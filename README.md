@@ -6,13 +6,15 @@ Each launcher contains its validation engine internally and does not require ano
 
 ## Language support
 
-All three scripts support the following languages:
+All three scripts support the following public-facing languages:
 
-| Language | Accepted values |
+| Language | Example parameter value |
 | --- | --- |
-| English | `English`, `en-US` |
-| Spanish | `Spanish`, `es-VE` |
-| Portuguese | `Portuguese`, `pt-BR` |
+| English | `English` |
+| Spanish | `Spanish` |
+| Portuguese | `Portuguese` |
+
+Use the simple language names in your commands. This keeps the examples clear and easier to read for clients and end users.
 
 You can choose a language in either of two ways:
 
