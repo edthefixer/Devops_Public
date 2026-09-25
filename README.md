@@ -2,7 +2,39 @@
 
 This repository contains three self-contained PowerShell launchers for validating Azure Virtual Desktop (AVD) deployment readiness.
 
-The scripts support English, Spanish, and Portuguese. Each launcher contains its validation engine internally and does not require another script from this repository.
+Each launcher contains its validation engine internally and does not require another script from this repository.
+
+## Language support
+
+All three scripts support the following languages:
+
+| Language | Accepted values |
+| --- | --- |
+| English | `English`, `en-US` |
+| Spanish | `Spanish`, `es-VE` |
+| Portuguese | `Portuguese`, `pt-BR` |
+
+You can choose a language in either of two ways:
+
+- Provide the `-Language` parameter.
+- Omit `-Language` during an interactive run and select the language from the menu.
+
+For unattended or repeatable runs, provide `-Language` and `-NonInteractive`. If `-NonInteractive` is used without `-Language`, English is selected by default.
+
+Examples:
+
+```powershell
+# English
+.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 -Language English
+
+# Spanish
+.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 -Language Spanish
+
+# Portuguese
+.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 -Language Portuguese
+```
+
+The language selection applies to the validation messages and generated output supported by each embedded validation engine.
 
 ## Scripts
 
@@ -103,6 +135,18 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 Replace the subscription ID, tenant ID, and region with values from the environment being checked.
 
+To run this validation in Spanish or Portuguese, change the language parameter:
+
+```powershell
+-Language Spanish
+```
+
+or:
+
+```powershell
+-Language Portuguese
+```
+
 ## Run the VM size and quota validation
 
 ```powershell
@@ -124,6 +168,8 @@ Optional switches include:
 -IncludePricing
 -IncludeOnlyAccelerated
 ```
+
+Use `-Language Spanish` or `-Language Portuguese` to run this validation in those languages.
 
 ## Run the network validation
 
@@ -159,9 +205,11 @@ ActiveDirectoryDomainServices
 NotAssessed
 ```
 
+Use `-Language Spanish` or `-Language Portuguese` to run this validation in those languages.
+
 ## Reports
 
-Some validations export an Excel report by default. Reports are written beside the launcher unless a different report path is supplied. Review reports for environment-specific information before sharing them publicly.
+Some validations export an Excel report by default. Reports are written beside the launcher unless a different report path is supplied. Review reports for environment-specific information before sharing them.
 
 ## Security and privacy
 
