@@ -1,8 +1,8 @@
 # Azure Virtual Desktop Validation Scripts
 
-This repository contains three self-contained PowerShell launchers for validating Azure Virtual Desktop (AVD) deployment readiness.
+This repository contains three self-contained PowerShell scripts for validating Azure Virtual Desktop (AVD) deployment readiness.
 
-Each launcher contains its validation engine internally and does not require another script from this repository.
+Each script contains its validation engine internally and does not require another script from this repository.
 
 ## Language support
 
@@ -40,7 +40,7 @@ The language selection applies to the validation messages and generated output s
 
 ## Scripts
 
-### `00_AVD_Check_Deployment_Readiness_Launcher.ps1`
+### `00_AVD_Check_Deployment_Readiness.ps1`
 
 Performs a broad AVD pre-deployment readiness validation, including checks related to:
 
@@ -50,7 +50,7 @@ Performs a broad AVD pre-deployment readiness validation, including checks relat
 - Resource group, virtual network, subnet, and storage configuration
 - Connectivity and Active Directory validation
 
-### `01_AVD_Validate_VMSizeAndQuota_Launcher.ps1`
+### `01_AVD_Validate_VMSizeAndQuota.ps1`
 
 Validates VM size and quota suitability for an AVD deployment, including:
 
@@ -60,7 +60,7 @@ Validates VM size and quota suitability for an AVD deployment, including:
 - Deployment-ready VM sizes
 - Optional pricing and accelerated-networking information
 
-### `02_AVD_Validate_Network_Configuration_Launcher.ps1`
+### `02_AVD_Validate_Network_Configuration.ps1`
 
 Validates AVD network configuration, including:
 
@@ -97,7 +97,7 @@ cd Devops_Public
 
 The person running the script must authenticate to the Azure environment being checked. Do not use credentials belonging to the repository owner or another organization.
 
-The launchers expose several authentication methods, including:
+The scripts expose several authentication methods, including:
 
 - `ExistingContext`
 - `Interactive`
@@ -122,7 +122,7 @@ Authentication and required permissions depend on the checks being performed. A 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
-.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 `
+.\00_AVD_Check_Deployment_Readiness.ps1 `
     -Language English `
     -SubscriptionId "YOUR-SUBSCRIPTION-ID" `
     -TenantId "YOUR-TENANT-ID" `
@@ -152,7 +152,7 @@ or:
 ## Run the VM size and quota validation
 
 ```powershell
-.\01_AVD_Validate_VMSizeAndQuota_Launcher.ps1 `
+.\01_AVD_Validate_VMSizeAndQuota.ps1 `
     -Language English `
     -SubscriptionId "YOUR-SUBSCRIPTION-ID" `
     -TenantId "YOUR-TENANT-ID" `
@@ -176,7 +176,7 @@ Use `-Language Spanish` or `-Language Portuguese` to run this validation in thos
 ## Run the network validation
 
 ```powershell
-.\02_AVD_Validate_Network_Configuration_Launcher.ps1 `
+.\02_AVD_Validate_Network_Configuration.ps1 `
     -Language English `
     -SubscriptionId "YOUR-SUBSCRIPTION-ID" `
     -AuthMethod ExistingContext `
@@ -191,7 +191,7 @@ Optional validation switches include:
 -SkipLatencyTest
 ```
 
-The network launcher supports these session host join types:
+The network validation script supports these session host join types:
 
 ```text
 MicrosoftEntraID
@@ -211,7 +211,7 @@ Use `-Language Spanish` or `-Language Portuguese` to run this validation in thos
 
 ## Reports
 
-Some validations export an Excel report by default. Reports are written beside the launcher unless a different report path is supplied. Review reports for environment-specific information before sharing them.
+Some validations export an Excel report by default. Reports are written beside the script unless a different report path is supplied. Review reports for environment-specific information before sharing them.
 
 ## Security and privacy
 
