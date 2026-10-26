@@ -27,13 +27,13 @@ Examples:
 
 ```powershell
 # English
-.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 -Language English
+.\00_AVD_Check_Deployment_Readiness.ps1 -Language English
 
 # Spanish
-.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 -Language Spanish
+.\00_AVD_Check_Deployment_Readiness.ps1 -Language Spanish
 
 # Portuguese
-.\00_AVD_Check_Deployment_Readiness_Launcher.ps1 -Language Portuguese
+.\00_AVD_Check_Deployment_Readiness.ps1 -Language Portuguese
 ```
 
 The language selection applies to the validation messages and generated output supported by each embedded validation engine.
