@@ -1,4 +1,5 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Self-contained AVD network configuration validation and remediation.
