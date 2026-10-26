@@ -1,4 +1,5 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Self-contained Azure Virtual Desktop pre-deployment readiness validation.
