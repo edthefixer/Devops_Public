@@ -2,13 +2,84 @@
 
 <#
 .SYNOPSIS
-    Self-contained AVD network configuration validation and remediation.
+    Checks the Azure networking an AVD deployment depends on: virtual networks, DNS, peering, routing and latency. Can fix some issues, only when asked.
+
 .DESCRIPTION
-    Selects English, Spanish, or Portuguese and executes the complete validation
-    engine embedded in this file. It has no external script, repository module,
-    OneDrive, Documents, or fixed root-drive temp dependency. Missing modules are staged in
-    a unique OS-managed temporary directory that is deleted after execution. The
-    dedicated worker process guarantees Azure assembly cleanup from memory on exit.
+    Checks the network side of an Azure Virtual Desktop deployment in one subscription:
+    virtual networks and subnets, network security group rules AVD needs, DNS and
+    private DNS zones, virtual network peering, routes that would block AVD traffic,
+    and latency to Azure. It can also report what the chosen session host join type
+    and profile storage authentication require of the network.
+
+    By default it is read-only. Issues it knows how to fix (a missing NSG rule, a
+    missing private DNS zone, a peering problem, a blocking route) are listed at the
+    end, and are only changed when -EnableRemediation is given.
+
+    The script runs in English, Spanish or Portuguese. Without -Language it asks.
+
+    Every run signs in afresh. Before signing in it clears the Azure PowerShell sign-in
+    saved on this computer (Clear-AzContext), so other Azure PowerShell sessions will
+    need to sign in again afterwards. Interactive runs offer browser, device code and
+    other sign-in methods; -NonInteractive uses browser sign-in.
+
+    Missing Az modules are staged in a temporary folder for the run and removed
+    afterwards. An Excel report is written beside the script.
+
+.PARAMETER Language
+    English, Spanish or Portuguese (en-US, es-VE and pt-BR are also accepted).
+    Without it the script asks, or uses English with -NonInteractive.
+
+.PARAMETER SubscriptionId
+    The subscription to check. Without it the script lists your subscriptions to choose from.
+    With -NonInteractive and no -SubscriptionId it continues only if the account has exactly one subscription.
+
+.PARAMETER SkipDNSValidation
+    Skips the DNS and private DNS zone checks.
+
+.PARAMETER SkipPeeringValidation
+    Skips the virtual network peering checks.
+
+.PARAMETER SkipLatencyTest
+    Skips the latency test.
+
+.PARAMETER SessionHostJoinType
+    How the session hosts will join a directory: MicrosoftEntraID, ActiveDirectoryDomainServices,
+    or NotAssessed. Adds what that choice requires of the network. Without it the script
+    asks, or uses NotAssessed with -NonInteractive.
+
+.PARAMETER ProfileStorageAuthentication
+    How FSLogix profile storage on Azure Files authenticates users: MicrosoftEntraKerberos,
+    ActiveDirectoryDomainServices, or NotAssessed. Adds what that choice requires of the
+    network. Without it the script asks, or uses NotAssessed with -NonInteractive.
+
+.PARAMETER ReportPath
+    A name for the Excel report. Only the file name is used: the report is always written beside the script.
+
+.PARAMETER NonInteractive
+    Runs without menus or prompts, for automation. Remediation is skipped unless both -EnableRemediation and -AutoFixAll are given.
+
+.PARAMETER EnableRemediation
+    After the checks, offers to fix the issues it can: all of them, or one at a time with a prompt for each.
+    This changes Azure resources. Without it the script only reports them.
+
+.PARAMETER AutoFixAll
+    With -EnableRemediation, fixes every issue it can without asking. This changes Azure
+    resources with no prompt: review a read-only run first.
+
+.EXAMPLE
+    .\02_AVD_Validate_Network_Configuration.ps1
+
+    Asks for the language, sign-in, subscription and identity choices, then checks the network. Read-only.
+
+.EXAMPLE
+    .\02_AVD_Validate_Network_Configuration.ps1 -Language English -SubscriptionId "YOUR-SUBSCRIPTION-ID" -SessionHostJoinType MicrosoftEntraID -ProfileStorageAuthentication MicrosoftEntraKerberos -NonInteractive
+
+    Unattended, read-only run for Entra-joined session hosts with Entra Kerberos profile storage.
+
+.EXAMPLE
+    .\02_AVD_Validate_Network_Configuration.ps1 -SubscriptionId "YOUR-SUBSCRIPTION-ID" -EnableRemediation
+
+    Checks the network, then offers to fix what it found, asking before each change.
 #>
 [CmdletBinding(SupportsShouldProcess = $false)]
 param(

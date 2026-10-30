@@ -23,22 +23,33 @@
     WHAT IT VALIDATES  (15 sequential check areas)
     -----------------------------------------------
         1  PowerShell environment (version, required Az modules)
-        2  Azure authentication and subscription status
-        3  Resource provider registration (8 required, 3 recommended)
-        4  Entra ID (Azure AD) tenant requirements
-        5  RBAC role assessment (current user + what is needed for deployment)
-        6  Network configuration (VNet, subnets, NSG, DNS, routes, peering)
-        7  AVD endpoint connectivity (TCP tests to required Microsoft FQDNs)
-        8  Compute quota and VM SKU availability in the target region
-        9  Storage / FSLogix readiness (identity auth, TLS, SMB port 445)
-        10 Identity model-specific checks:
+        2  Azure sign-in
+        3  Subscription and tenant status
+        4  Resource provider registration (8 required, 3 recommended)
+        5  Entra ID tenant requirements, for every identity model (AVD service
+           principal, single sign-on service principal, Conditional Access review)
+        6  RBAC role assessment (current user + what is needed for deployment)
+        7  Network configuration (VNet, subnets, NSG, DNS, routes, peering)
+        8  AVD endpoint connectivity (TCP tests to required Microsoft FQDNs)
+        9  Compute quota and VM SKU availability in the target region
+        10 Storage / FSLogix readiness (identity auth, TLS, SMB port 445)
+        11 Identity model-specific checks:
                  ADDS            - Active Directory DNS and LDAP connectivity
+                 EntraID         - Entra join: the Virtual Machine User Login role
+                                   (host pools without an Entra sign-in RDP
+                                   property are also flagged in area 14)
                  EntraIDKerberos - Hybrid Kerberos / Entra Connect sync validation
                  EntraDS         - Microsoft Entra Domain Services readiness
-        11 Monitoring readiness (Log Analytics workspace)
-        12 Key Vault security settings
-        13 Existing AVD resource health (host pools, SSO configuration, etc.)
-        14 Azure Compute Gallery and session host image readiness
+        12 Monitoring readiness (Log Analytics workspace)
+        13 Key Vault security settings
+        14 Existing AVD resource health (host pools, SSO configuration, etc.)
+        15 Azure Compute Gallery and session host image readiness
+
+    SIGN-IN
+    -------
+    By default the script uses the Azure PowerShell session you already have
+    (Connect-AzAccount). Choosing Interactive or DeviceCode sign-in first signs
+    out the account Azure PowerShell currently holds on this computer.
 
     RESULTS FORMAT
     --------------
@@ -50,17 +61,17 @@
 
     REPORTS
     -------
-    Use -ExportReport to generate a timestamped Excel report in the folder
-    specified by -ReportPath. The workbook contains every check result with all
-    Roadblock and HowToFix fields, making it easy to share with other teams or
-    to track remediation progress.
+    Every run writes a timestamped Excel report to -ReportPath (default: the
+    script's folder), unless -NoExport is given. The workbook contains every
+    check result with all Roadblock and HowToFix fields, making it easy to share
+    with other teams or to track remediation progress.
 
     AUTOMATION / PIPELINE USE
     -------------------------
     Use -PassThru to return a structured PSCustomObject at exit that contains
     Results[], FailCount, WarnCount, and PassCount. This makes it straightforward
     to consume the output from an automation script or orchestration pipeline.
-    Use -NonInteractive together with -ExportReport for unattended execution.
+    Use -NonInteractive for unattended execution.
 
     STANDALONE
     ----------
@@ -72,7 +83,8 @@
     The Azure Subscription ID to validate. Defaults to the current context.
 
 .PARAMETER TenantId
-    Azure Tenant ID. Required when AuthMethod is Interactive/DeviceCode.
+    Azure Tenant ID. Required with -NonInteractive for ServicePrincipalSecret and
+    ServicePrincipalCertificate; for other sign-in methods it selects the tenant to sign in to.
 
 .PARAMETER TargetRegion
     The Azure region where AVD will be deployed (e.g. 'eastus2', 'westeurope').
@@ -139,7 +151,7 @@
     Folder for the Excel report. Defaults to the script's own folder.
 
 .PARAMETER ExportReport
-    Write a timestamped Excel report of every check to -ReportPath.
+    Accepted for compatibility. The Excel report is always written unless -NoExport is given.
 
 .PARAMETER CriticalOnly
     Show failures only in the console summary; warnings are left out.
@@ -2277,6 +2289,61 @@ function Test-AVDEntraDSReadiness {
     }
 }
 
+function Test-AVDEntraJoinReadiness {
+    [CmdletBinding()]
+    param(
+        [string]$ResourceGroupName
+    )
+
+    Write-AVDSection -Title 'MICROSOFT ENTRA JOIN READINESS'
+
+    # Users of Entra-joined session hosts need one of these roles on the VMs (or a scope above them).
+    $signInRoles = [ordered]@{
+        'Virtual Machine User Login'          = 'fb879df8-f326-4884-b1cf-06f3ad86be52'
+        'Virtual Machine Administrator Login' = '1c0163c0-47e6-4577-8991-ea5c82e286e4'
+    }
+    $scopeLabel = if ($ResourceGroupName) { "resource group '$ResourceGroupName'" } else { 'the subscription' }
+
+    try {
+        $found = @()
+        $rgScope = if ($ResourceGroupName) { '/subscriptions/{0}/resourceGroups/{1}' -f (Get-AzContext).Subscription.Id, $ResourceGroupName }
+        foreach ($roleName in $signInRoles.Keys) {
+            # -ResourceGroupName cannot be combined with -RoleDefinitionId; -Scope can.
+            $assignments = if ($ResourceGroupName) {
+                @(Get-AzRoleAssignment -Scope $rgScope -RoleDefinitionId $signInRoles[$roleName] -ErrorAction Stop)
+            } else {
+                @(Get-AzRoleAssignment -RoleDefinitionId $signInRoles[$roleName] -ErrorAction Stop)
+            }
+            if ($assignments.Count -gt 0) { $found += "$roleName ($($assignments.Count) assignment(s))" }
+        }
+
+        if ($found.Count -gt 0) {
+            Add-AVDCheckResult `
+                -Category 'Identity-EntraID' `
+                -CheckName 'VM Sign-in Role Assignments' `
+                -Result 'PASS' `
+                -Details "Applies to ${scopeLabel} (assigned there or above): $($found -join '; ')"
+        } else {
+            Add-AVDCheckResult `
+                -Category 'Identity-EntraID' `
+                -CheckName 'VM Sign-in Role Assignments' `
+                -Result 'WARN' `
+                -Details "No Virtual Machine User Login or Virtual Machine Administrator Login assignment found in $scopeLabel." `
+                -Roadblock 'Users cannot sign in to Microsoft Entra-joined session hosts without one of these roles, even when they are assigned to the application group.' `
+                -HowToFix "Assign the role to the AVD user group on the session hosts' resource group: New-AzRoleAssignment -ObjectId <group object id> -RoleDefinitionName 'Virtual Machine User Login' -ResourceGroupName <session host RG>" `
+                -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/azure-ad-joined-session-hosts#assign-user-access-to-host-pools'
+        }
+    } catch {
+        Add-AVDCheckResult `
+            -Category 'Identity-EntraID' `
+            -CheckName 'VM Sign-in Role Assignments' `
+            -Result 'WARN' `
+            -Details "Could not read role assignments in ${scopeLabel}: $($_.Exception.Message)" `
+            -HowToFix 'Run with an account that can read role assignments (Reader is enough), or check in the portal: resource group > Access control (IAM) > Role assignments.' `
+            -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/azure-ad-joined-session-hosts#assign-user-access-to-host-pools'
+    }
+}
+
 #endregion
 
 #region -- RBAC Validation -----------------------------------------------------
@@ -2568,6 +2635,15 @@ function Test-AVDServiceConfiguration {
                     -CheckName "HostPool '$hpName'  -  Entra ID Join RDP Property" `
                     -Result 'PASS' `
                     -Details 'targetisaadjoined:i:1 is set'
+            } elseif ($IdentityModel -eq 'EntraID' -and $rdp -notmatch 'enablerdsaadauth:i:1') {
+                # With single sign-on enabled the property is not needed; without either, many clients cannot connect.
+                Add-AVDCheckResult `
+                    -Category 'AVD' `
+                    -CheckName "HostPool '$hpName'  -  Entra ID Join RDP Property" `
+                    -Result 'WARN' `
+                    -Details 'Neither targetisaadjoined:i:1 nor single sign-on (enablerdsaadauth:i:1) is set. Users connecting from devices that are not joined to this Entra tenant cannot sign in to Entra-joined session hosts.' `
+                    -HowToFix "Enable single sign-on (recommended), or add the property: Update-AzWvdHostPool -Name '$hpName' -ResourceGroupName <RG> -CustomRdpProperty 'targetisaadjoined:i:1;$rdp'" `
+                    -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/azure-ad-joined-session-hosts'
             } else {
                 Add-AVDCheckResult `
                     -Category 'AVD' `
@@ -3356,9 +3432,9 @@ $summary = $null
 # Use -NonInteractive to skip the wizard entirely (CI/CD pipelines, AI agents).
 # -----------------------------------------------------------------------------
 try {
-    # Report export is always enabled and always written to script root.
+    # Report export is always enabled; it goes to -ReportPath when given, else to the script root.
     $ExportReport = $true
-    $ReportPath = $script:ReportRootPath
+    if (-not $PSBoundParameters.ContainsKey('ReportPath')) { $ReportPath = $script:ReportRootPath }
     $PreferredAuthMethod = $null
     $ReuseExistingContext = $false
 
@@ -3590,6 +3666,11 @@ if ($runAD -and $DomainName) {
 # Entra ID Kerberos Hybrid - specific checks (Hybrid AAD Join + AADKERB storage)
 if ($IdentityModel -in @('EntraIDKerberos','All')) {
     Test-AVDEntraIDKerberosHybrid -DomainName $DomainName
+}
+
+# Microsoft Entra join - specific checks (cloud-only session hosts)
+if ($IdentityModel -in @('EntraID','All')) {
+    Test-AVDEntraJoinReadiness -ResourceGroupName $ResourceGroupName
 }
 
 # Microsoft Entra Domain Services - specific checks (managed domain)

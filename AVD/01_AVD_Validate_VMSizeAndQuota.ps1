@@ -2,13 +2,89 @@
 
 <#
 .SYNOPSIS
-    Self-contained AVD VM size and quota validation.
+    Lists the Azure VM sizes that can host AVD session hosts in a region, and whether your quota allows them. Read-only.
+
 .DESCRIPTION
-    Selects English, Spanish, or Portuguese and executes the complete validation
-    engine embedded in this file. It has no external script, repository module,
-    OneDrive, Documents, or fixed root-drive temp dependency. Missing modules are staged in
-    a unique OS-managed temporary directory that is deleted after execution. The
-    dedicated worker process guarantees Azure assembly cleanup from memory on exit.
+    Checks which VM sizes in one Azure region are suitable for Azure Virtual Desktop
+    session hosts: approved AVD-capable series, minimum vCPU and memory, workload
+    category, SKU restrictions on the subscription, and remaining vCPU quota. It can
+    add pay-as-you-go prices and limit the list to sizes with Accelerated Networking.
+    It changes nothing in Azure.
+
+    The script runs in English, Spanish or Portuguese. Without -Language it asks.
+
+    Every run signs in afresh. Before signing in it clears the Azure PowerShell sign-in
+    saved on this computer (Clear-AzContext), so other Azure PowerShell sessions will
+    need to sign in again afterwards. Interactive runs offer browser, device code and
+    other sign-in methods; -NonInteractive uses browser sign-in.
+
+    Missing Az modules are staged in a temporary folder for the run and removed
+    afterwards. Unless -NoExport is given, an Excel report is written beside the script.
+
+.PARAMETER Language
+    English, Spanish or Portuguese (en-US, es-VE and pt-BR are also accepted).
+    Without it the script asks, or uses English with -NonInteractive.
+
+.PARAMETER SubscriptionId
+    The subscription to check. Without it the script lists your subscriptions to choose from.
+    With -NonInteractive, give it: otherwise the signed-in account's default subscription is used.
+
+.PARAMETER TenantId
+    The Microsoft Entra tenant to sign in to. Without it the script lists your tenants to choose from.
+    Required with -NonInteractive.
+
+.PARAMETER Location
+    The Azure region to check, by short name (for example eastus2, westeurope).
+    Without it the script asks, also with -NonInteractive, so give it for unattended runs.
+
+.PARAMETER MinCores
+    The fewest vCPUs a size may have to be listed. 1 to 128; default 1.
+
+.PARAMETER MinMemoryGB
+    The least memory, in GB, a size may have to be listed. 1 to 512; default 4.
+
+.PARAMETER WorkloadType
+    Limits the list to one workload category: Light, Medium, Heavy, Graphics (GPU sizes), or All (default).
+
+.PARAMETER IncludePricing
+    Adds pay-as-you-go prices from the Azure Retail Prices API.
+
+.PARAMETER IncludeOnlyAccelerated
+    Lists only sizes that support Accelerated Networking.
+
+.PARAMETER DeploymentReadyOnly
+    $true (default) lists only sizes that the subscription may use and that fit the
+    remaining quota. $false lists every suitable size, marked ready or not, with any SKU restriction.
+
+.PARAMETER ForceReauth
+    Accepted for compatibility. Every run already signs in afresh.
+
+.PARAMETER NonInteractive
+    Runs without menus or prompts, for automation. Give -TenantId, -SubscriptionId and -Location.
+
+.PARAMETER PassThru
+    Also returns the analysed VM sizes as objects, for use in a pipeline.
+
+.PARAMETER NoExport
+    Does not write the Excel report.
+
+.PARAMETER SkipModuleValidation
+    Skips the check for the required Az modules. For a calling script that has already done it.
+
+.EXAMPLE
+    .\01_AVD_Validate_VMSizeAndQuota.ps1
+
+    Asks for the language, sign-in, subscription and region, then lists the deployable sizes.
+
+.EXAMPLE
+    .\01_AVD_Validate_VMSizeAndQuota.ps1 -Language English -TenantId "YOUR-TENANT-ID" -SubscriptionId "YOUR-SUBSCRIPTION-ID" -Location eastus2 -MinCores 4 -MinMemoryGB 16 -NonInteractive
+
+    Unattended run for sizes with at least 4 vCPUs and 16 GB in East US 2.
+
+.EXAMPLE
+    .\01_AVD_Validate_VMSizeAndQuota.ps1 -Location westeurope -WorkloadType Graphics -IncludePricing -DeploymentReadyOnly $false
+
+    Every GPU size in West Europe with prices, including those the subscription cannot deploy yet.
 #>
 [CmdletBinding(SupportsShouldProcess = $false)]
 param(

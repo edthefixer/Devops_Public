@@ -65,6 +65,10 @@ VM SKU INTELLIGENCE FEATURES:
 - Alternative Recommendations: Suggests unrestricted SKU alternatives when preferred SKU has limitations
 - Detailed Capability Analysis: Memory, CPU, storage, networking, and specialized feature support breakdown
 
+.PARAMETER SubscriptionId
+The subscription to check. Without it, a single accessible subscription is used, otherwise
+the script lists them to choose from; with -NonInteractive it uses the signed-in context's subscription.
+
 .PARAMETER TargetRegion
 Azure region for AVD deployment validation. If not specified, displays interactive region selection menu 
 with top 10 popular regions and expandable full list. Validates region supports required resource types.

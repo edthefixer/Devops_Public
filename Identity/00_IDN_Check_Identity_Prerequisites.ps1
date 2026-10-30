@@ -111,6 +111,9 @@
 .PARAMETER PassThru
     Return the summary object to the caller.
 
+.PARAMETER ExportReport
+    Accepted for compatibility. The Excel report is always written unless -NoExport is given.
+
 .PARAMETER NoExport
     Do not write the Excel report.
 

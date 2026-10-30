@@ -1,0 +1,5 @@
+# Run reports hold tenant, subscription and network details. Never publish them.
+*.xlsx
+*.csv
+*.html
+~$*
