@@ -2,7 +2,7 @@
 
 PowerShell scripts that check whether an environment is ready before anything is deployed: Azure Virtual Desktop (AVD), Microsoft Intune, and identity provisioning across cloud and on-premises.
 
-Every script is self-contained: one `.ps1` file, no other file from this repository required. They report what is wrong, why it matters and how to fix it. **They change nothing unless you explicitly ask**, and the scripts that can offer a change say so below.
+Every script is self-contained: one `.ps1` file, no other file from this repository required. The one exception is `AVD\03_AVD_Check_Platform_Prerequisites.ps1`, which runs `00_AVD_Check_Deployment_Readiness.ps1` as part of its check, so keep the two in the same folder. They report what is wrong, why it matters and how to fix it. **They change nothing unless you explicitly ask**, and the scripts that can offer a change say so below.
 
 | Folder | Script | Checks |
 | --- | --- | --- |
@@ -41,6 +41,8 @@ Downloaded scripts may need to be allowed for the current session:
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
+
+In **PowerShell ISE**, type that line in the console pane before pressing F5, and open the script from its file rather than pasting it into a new tab. The script then continues in a new PowerShell window, because ISE cannot show their output.
 
 ## Authentication
 

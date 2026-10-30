@@ -212,6 +212,28 @@ param(
     [switch]$SkipModuleValidation
 )
 
+# PowerShell ISE cannot show the console of a child process, and this script starts
+# one, so from ISE it reopens itself in a PowerShell window with the same parameters.
+if ($Host.Name -eq 'Windows PowerShell ISE Host') {
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        Write-Warning 'Save this script to a file, then run it from a PowerShell window.'
+        return
+    }
+    $iseParameters = @{}
+    foreach ($iseKey in $PSBoundParameters.Keys) {
+        $iseValue = $PSBoundParameters[$iseKey]
+        if ($iseValue -is [System.Management.Automation.SwitchParameter]) { $iseValue = $iseValue.IsPresent }
+        $iseParameters[$iseKey] = $iseValue
+    }
+    $iseParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
+    $iseParameters | Export-Clixml -LiteralPath $iseParameterFile -Force
+    $iseCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p" -f $iseParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
+    $iseEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($iseCommand))
+    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoLogo', '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $iseEncoded)
+    Write-Host 'PowerShell ISE cannot show this script''s output, so it continues in a new PowerShell window.' -ForegroundColor Yellow
+    return
+}
+
 Set-StrictMode -Off   # Disabled to preserve PS5.1 broad compatibility with optional properties
 $ErrorActionPreference = 'Continue'
 
@@ -788,7 +810,8 @@ function Invoke-AVDFreshProcessRecovery {
 
     # Prefer relaunching into the same PowerShell engine (pwsh -> pwsh, powershell -> powershell).
     # Falling back to Windows PowerShell 5.1 can change cmdlet behavior and increase console noise.
-    $pwshExe = (Get-Process -Id $PID -ErrorAction SilentlyContinue).Path
+    # Resolve the engine, not the host: in PowerShell ISE this process is powershell_ise.exe.
+    $pwshExe = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
     if ([string]::IsNullOrWhiteSpace($pwshExe) -or -not (Test-Path -Path $pwshExe)) {
         $pwshExe = (Get-Command -Name 'pwsh.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     }
