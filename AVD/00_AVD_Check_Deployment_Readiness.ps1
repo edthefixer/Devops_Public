@@ -42,7 +42,8 @@
                  EntraDS         - Microsoft Entra Domain Services readiness
         12 Monitoring readiness (Log Analytics workspace)
         13 Key Vault security settings
-        14 Existing AVD resource health (host pools, SSO configuration, etc.)
+        14 Existing AVD resource health (host pools, SSO configuration,
+           application groups and their user assignments)
         15 Azure Compute Gallery and session host image readiness
 
     SIGN-IN
@@ -2674,6 +2675,31 @@ function Test-AVDServiceConfiguration {
                 -CheckName "HostPool '$hpName'  -  Type" `
                 -Result 'INFO' `
                 -Details "HostPoolType: $($hp.HostPoolType) | LoadBalancerType: $($hp.LoadBalancerType) | MaxSessions: $($hp.MaxSessionLimit)"
+
+            # Users see a host pool's desktops and apps only through an application group they are assigned to.
+            $hpRg = ($hp.Id -split '/')[4]
+            $appGroups = @(Get-AzWvdApplicationGroup -ResourceGroupName $hpRg -ErrorAction SilentlyContinue |
+                Where-Object { [string]$_.HostPoolArmPath -eq [string]$hp.Id })
+            if ($appGroups.Count -eq 0) {
+                Add-AVDCheckResult `
+                    -Category 'AVD' `
+                    -CheckName "HostPool '$hpName'  -  Application Groups" `
+                    -Result 'WARN' `
+                    -Details "No application group in resource group '$hpRg' is linked to this host pool." `
+                    -HowToFix 'Create a desktop or RemoteApp application group for the host pool and register it in a workspace.' `
+                    -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/manage-app-groups'
+            }
+            foreach ($ag in $appGroups) {
+                $assigned = @(Get-AzRoleAssignment -Scope $ag.Id -RoleDefinitionName 'Desktop Virtualization User' -ErrorAction SilentlyContinue)
+                Add-AVDCheckResult `
+                    -Category 'AVD' `
+                    -CheckName "AppGroup '$($ag.Name)'  -  User Assignment" `
+                    -Result $(if ($assigned.Count -gt 0) { 'PASS' } else { 'WARN' }) `
+                    -Details "$($assigned.Count) Desktop Virtualization User assignment(s)" `
+                    -Roadblock $(if ($assigned.Count -eq 0) { 'No user sees this application group in the Remote Desktop client.' } else { '' }) `
+                    -HowToFix $(if ($assigned.Count -eq 0) { "Assign the users group to application group '$($ag.Name)' (Assignments), which grants Desktop Virtualization User." } else { '' }) `
+                    -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/manage-app-groups'
+            }
         }
 
     } catch {

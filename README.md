@@ -163,7 +163,11 @@ Microsoft Intune deployment readiness in twelve areas: PowerShell environment, G
 
 ### `00_IDN_Check_Identity_Prerequisites.ps1`
 
-Identity provisioning prerequisites for one identity model (`ADDS`, `EntraDS`, `EntraID` or `EntraIDKerberos`): directory synchronization, whether a test user has the right identity source, and the model's own dependencies. With `-Product AVD` (the default) it adds AVD's identity items: service principal, application group assignments, host pool sign-in properties, VM sign-in roles and FSLogix storage identity. `-CheckSsoConfiguration` adds single sign-on. Anything that cannot be read from Azure or Graph is reported with the exact command to check it by hand. Read-only. Its sign-in lasts for the run only and leaves other sessions on the computer alone. English.
+Every prerequisite Microsoft documents for one identity model, the way users and machines authenticate: `ADDS` (Active Directory Domain Services), `EntraDS` (Microsoft Entra Domain Services), `EntraID` (Microsoft Entra join) or `EntraIDKerberos` (Entra join with hybrid users and Entra Kerberos for Azure Files). One model per run; run it again to check another.
+
+It checks directory synchronization, whether a test user has the right identity source, and the model's own dependencies: domain and DNS, Azure Files identity, sign-in roles and Conditional Access, as the model requires. `-CheckSsoConfiguration` adds single sign-on for RDP. Anything that cannot be read from Azure or Graph is reported with the exact command to check it by hand. Product-specific identity items, such as an AVD host pool's sign-in settings, are checked by that product's script.
+
+The Excel report opens on a **Summary** sheet: the model checked, the tenant, who ran it and when, the verdict and the counts. Every requirement after it links to the Microsoft documentation it comes from, so it can be checked against the source. Read-only. Its sign-in lasts for the run only and leaves other sessions on the computer alone. English.
 
 ```powershell
 .\Identity\00_IDN_Check_Identity_Prerequisites.ps1 `

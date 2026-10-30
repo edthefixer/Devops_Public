@@ -7,26 +7,24 @@
     All validation functions are self-contained - no external module file required.
 
 .DESCRIPTION
-    Validates the identity dependencies a deployment needs, for the identity model it
-    will use. The identity model is the primary choice; the product being deployed adds
-    its own identity items on top.
+    Checks, for one identity model (the way users and machines authenticate), every
+    prerequisite Microsoft documents for it, and reports each one as PASS, FAIL, WARN,
+    INFO or SKIP, with why it matters, how to fix it, and a link to the Microsoft
+    documentation it comes from. Run it once per model to compare them.
+
+    It checks the identity model only. Product-specific identity items (for example an
+    Azure Virtual Desktop host pool's sign-in settings) are checked by that product's
+    own readiness script.
 
     IDENTITY MODELS  (each is a separate check path; only the selected one runs)
     -----------------------------------------------------------------------------
-        ADDS             Active Directory Domain Services. Session hosts join an AD DS
+        ADDS             Active Directory Domain Services. Machines join an AD DS
                          domain; users are synced from AD DS to Entra ID.
-        EntraDS          Microsoft Entra Domain Services. Session hosts join the managed
-                         domain; password hashes must reach Entra DS.
-        EntraID          Microsoft Entra ID. Session hosts are Entra joined; no domain.
-        EntraIDKerberos  Entra-joined session hosts with hybrid users, and Azure Files
-                         (FSLogix) authenticated through Microsoft Entra Kerberos.
-
-    PRODUCTS  (product-specific identity items, added on top of the model)
-    ----------------------------------------------------------------------
-        AVD              Azure Virtual Desktop: service principal, application group
-                         assignments, host pool RDP sign-in properties, VM sign-in
-                         roles, FSLogix storage identity.
-        None             Identity model only.
+        EntraDS          Microsoft Entra Domain Services. Machines join a Microsoft-
+                         managed domain; password hashes must reach Entra DS.
+        EntraID          Microsoft Entra ID. Machines are Entra joined; no domain.
+        EntraIDKerberos  Entra-joined machines with hybrid users, and Azure Files
+                         authenticated through Microsoft Entra Kerberos.
 
     WHAT EVERY RUN VALIDATES
     ------------------------
@@ -35,9 +33,16 @@
         3  Microsoft Graph sign-in and granted permissions
         4  Directory synchronization (required, optional, or not applicable per model)
         5  Test user identity source (hybrid or cloud-only, as the model requires)
-        6  The selected identity model's own dependencies
-        7  The selected product's identity items
-        8  Optional: single sign-on configuration (-CheckSsoConfiguration)
+        6  The selected identity model's own dependencies (domain, DNS, Azure Files
+           identity, sign-in roles, Conditional Access, as the model requires)
+        7  Optional, Entra models: single sign-on for RDP (-CheckSsoConfiguration)
+
+    REPORT
+    ------
+    The Excel report opens on a Summary sheet (identity model, tenant, who ran it and
+    when, verdict, counts), followed by every requirement with its result, why it
+    matters, how to fix it, and the Microsoft documentation link, so anyone can
+    check each requirement against the source.
 
     RESULTS FORMAT
     --------------
@@ -59,9 +64,6 @@
 .PARAMETER IdentityModel
     ADDS, EntraDS, EntraID, or EntraIDKerberos. The wizard asks when omitted.
 
-.PARAMETER Product
-    AVD (default) or None.
-
 .PARAMETER TenantId
     Tenant ID or domain. Required with -NonInteractive.
 
@@ -69,13 +71,11 @@
     Subscription holding the resources. Required with -NonInteractive for Azure checks.
 
 .PARAMETER VNetId
-    Resource ID of the session host virtual network (DNS and peering checks).
+    Resource ID of the virtual network the machines use (DNS and peering checks).
 
 .PARAMETER StorageAccountId
-    Resource ID of the Azure Files storage account used for FSLogix profiles.
-
-.PARAMETER HostPoolId
-    Resource ID of the AVD host pool (RDP properties, application groups, VM sign-in roles).
+    Resource ID of an Azure Files storage account whose users authenticate with this
+    identity model (for example, a share for FSLogix profiles).
 
 .PARAMETER TestUserUpn
     A user who will sign in. Validates that the user's identity source fits the model.
@@ -125,7 +125,7 @@
     Runs the guided wizard.
 
 .EXAMPLE
-    .\00_IDN_Check_Identity_Prerequisites.ps1 -NonInteractive -AuthMethod Interactive -IdentityModel EntraIDKerberos -Product AVD -TenantId contoso.com -SubscriptionId <id> -StorageAccountId <id> -HostPoolId <id> -TestUserUpn user@contoso.com
+    .\00_IDN_Check_Identity_Prerequisites.ps1 -NonInteractive -AuthMethod Interactive -IdentityModel EntraIDKerberos -TenantId contoso.com -SubscriptionId <id> -StorageAccountId <id> -TestUserUpn user@contoso.com
 
 .NOTES
     Author: etf
@@ -140,15 +140,11 @@ param(
     [ValidateSet('ADDS','EntraDS','EntraID','EntraIDKerberos')]
     [string]$IdentityModel,
 
-    [ValidateSet('AVD','None')]
-    [string]$Product = 'AVD',
-
     [string]$TenantId,
     [string]$SubscriptionId,
 
     [string]$VNetId,
     [string]$StorageAccountId,
-    [string]$HostPoolId,
     [string]$TestUserUpn,
     [string]$DomainName,
 
@@ -508,6 +504,23 @@ function Export-IDNValidationReport {
     $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
     $excelPath = Join-Path $OutputPath ("$($script:ReportScriptName)_$ts.xlsx")
 
+    # A cover sheet a client can read on its own: what was checked, where, by whom, and the outcome.
+    $verdict = if ($script:FailCount -gt 0) { "FAIL: $($script:FailCount) blocker(s) to resolve before users can sign in" }
+               elseif ($script:WarnCount -gt 0) { "WARN: no blockers, $($script:WarnCount) warning(s) to review" }
+               else { 'PASS: the identity prerequisites checked are in place' }
+    $modelName = if ($IdentityModel -and $script:ModelNames.ContainsKey($IdentityModel)) { $script:ModelNames[$IdentityModel] } else { 'not selected' }
+    @(
+        [PSCustomObject]@{ Item = 'Identity model checked'; Value = $modelName }
+        [PSCustomObject]@{ Item = 'Tenant';                 Value = $(if ($TenantId) { $TenantId } else { 'not selected' }) }
+        [PSCustomObject]@{ Item = 'Subscription';           Value = $(if ($SubscriptionId) { $SubscriptionId } else { 'none (directory checks only)' }) }
+        [PSCustomObject]@{ Item = 'Run by';                 Value = "$env:USERNAME on $env:COMPUTERNAME" }
+        [PSCustomObject]@{ Item = 'Completed';              Value = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
+        [PSCustomObject]@{ Item = 'Verdict';                Value = $verdict }
+        [PSCustomObject]@{ Item = 'Checks';                 Value = "$($script:TotalChecks) total: $($script:PassCount) pass, $($script:FailCount) fail, $($script:WarnCount) warn, $($script:InfoCount) info, $($script:SkipCount) skipped" }
+        [PSCustomObject]@{ Item = 'Changes made';           Value = 'None. Read-only: Azure Resource Manager and Microsoft Graph GET requests only.' }
+        [PSCustomObject]@{ Item = 'How to verify';          Value = "Every requirement on the 'Validation Results' sheet links (DocLink) to the Microsoft documentation it comes from." }
+    ) | Export-Excel -Path $excelPath -WorksheetName 'Summary' -AutoSize -BoldTopRow
+
     $script:ValidationResults.ToArray() |
         Export-Excel -Path $excelPath -WorksheetName 'Validation Results' -AutoSize -FreezeTopRow -BoldTopRow
 
@@ -723,7 +736,6 @@ function Get-IDNPropertyValue {
 
 # First-party application IDs (the same in every tenant).
 $script:AppIds = @{
-    AzureVirtualDesktop       = '9cdead84-a844-4324-93f2-b2e6bb768d07'
     MicrosoftRemoteDesktop    = 'a4a365df-50f1-4397-bc59-1a1564b8bb9c'
     WindowsCloudLogin         = '270efc09-cd0d-444b-a71f-39af4910ec45'
     AzureWindowsVmSignIn      = '372140e0-b3b7-4226-8ef9-d57986796201'
@@ -732,7 +744,6 @@ $script:AppIds = @{
 
 # Azure built-in role definition IDs.
 $script:RoleIds = @{
-    DesktopVirtualizationUser        = '1d18fff3-a72a-46b5-b4a9-0b38a3cd7e63'
     VirtualMachineUserLogin          = 'fb879df8-f326-4884-b1cf-06f3ad86be52'
     VirtualMachineAdministratorLogin = '1c0163c0-47e6-4577-8991-ea5c82e286e4'
     SmbShareReader                   = 'aba4ae5f-2193-4029-9191-0cb91df5e314'
@@ -887,7 +898,7 @@ try {
         Clear-Screen
         Say ''; Say "  $line70" 'White'; Say '  STEP 3 of 6  -  YOUR AZURE SUBSCRIPTION' 'White'; Say "  $line70" 'White'; Say ''
         Say '  The subscription that holds (or will hold) the virtual network, storage'
-        Say '  account and host pool. Azure resource checks run against it.'
+        Say '  account and domain. Azure resource checks run against it.'
         Say ''
         for ($i = 0; $i -lt $subs.Count; $i++) {
             Say ("  [{0,2}] {1}" -f ($i + 1), $subs[$i].Name) 'White'
@@ -1284,7 +1295,7 @@ function Test-IDNTestUser {
                     -Details "Source: $source" `
                     -Roadblock "$($script:ModelNames[$Model]) authenticates against AD DS identities (Kerberos tickets carry the on-premises SID). A cloud-only user cannot sign in to an AD DS domain or reach an Entra Kerberos file share with NTFS permissions." `
                     -HowToFix 'Create the user in AD DS and let sync link it to Entra ID, or choose the Entra ID model for cloud-only users.' `
-                    -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/authentication'
+                    -DocLink 'https://learn.microsoft.com/entra/identity/hybrid/whatis-hybrid-identity'
             }
         }
         'EntraDS' {
@@ -1314,7 +1325,7 @@ function Test-IDNTestUser {
     $licenses = @($user.assignedLicenses).Count
     Add-IDNCheckResult -Category 'User' -CheckName "Licenses: $UserPrincipalName" -Result $(if ($licenses -gt 0) { 'INFO' } else { 'WARN' }) `
         -Details "$licenses license(s) assigned" `
-        -HowToFix $(if ($licenses -eq 0) { 'Assign a license that grants the product (for AVD: Microsoft 365 E3/E5/A3/A5/F3/Business Premium, or Windows Enterprise E3/E5).' } else { '' })
+        -HowToFix $(if ($licenses -eq 0) { 'Assign the license the deployment needs (for example Microsoft 365 or Windows Enterprise for desktop and device scenarios; Microsoft Entra ID P1 for Conditional Access).' } else { '' })
 }
 
 function Test-IDNVNetDns {
@@ -1326,7 +1337,7 @@ function Test-IDNVNetDns {
 
     $dnsDoc = 'https://learn.microsoft.com/azure/virtual-network/virtual-networks-name-resolution-for-vms-and-role-instances'
     if ($null -eq $script:SelectedVNet) {
-        Add-IDNCheckResult -Category 'Network' -CheckName 'Session Host VNet DNS' -Result 'SKIP' `
+        Add-IDNCheckResult -Category 'Network' -CheckName 'VNet DNS' -Result 'SKIP' `
             -Details 'No virtual network selected. Pass -VNetId to validate DNS for domain join.'
         return
     }
@@ -1340,7 +1351,7 @@ function Test-IDNVNetDns {
             if ($dns.Count -eq 0) {
                 Add-IDNCheckResult -Category 'Network' -CheckName "VNet DNS: $($vnet.name)" -Result 'FAIL' `
                     -Details 'The VNet uses Azure-provided DNS.' `
-                    -Roadblock 'Azure DNS cannot resolve the AD DS domain, so session hosts cannot locate a domain controller and domain join fails.' `
+                    -Roadblock 'Azure DNS cannot resolve the AD DS domain, so machines cannot locate a domain controller and domain join fails.' `
                     -HowToFix 'Set the VNet DNS servers to the domain controllers (or DNS forwarders that resolve the AD zone), then restart the VMs.' `
                     -DocLink $dnsDoc
             } else {
@@ -1359,7 +1370,7 @@ function Test-IDNVNetDns {
             } else {
                 Add-IDNCheckResult -Category 'Network' -CheckName "VNet DNS: $($vnet.name)" -Result 'FAIL' `
                     -Details "DNS: $dnsText | Managed domain controllers: $($ExpectedDnsServers -join ', ')" `
-                    -Roadblock 'Session hosts cannot locate the managed domain, so domain join fails.' `
+                    -Roadblock 'Machines cannot locate the managed domain, so domain join fails.' `
                     -HowToFix "Set the VNet DNS servers to $($ExpectedDnsServers -join ' and '), then restart the VMs." `
                     -DocLink 'https://learn.microsoft.com/entra/identity/domain-services/tutorial-configure-networking#configure-dns-servers-in-the-peered-virtual-network'
             }
@@ -1378,12 +1389,12 @@ function Test-IDNStorageIdentity {
         [string]$StorageAccountId
     )
 
-    Write-IDNSection -Title 'AZURE FILES IDENTITY (FSLOGIX PROFILES)'
+    Write-IDNSection -Title 'AZURE FILES IDENTITY'
     $filesDoc = 'https://learn.microsoft.com/azure/storage/files/storage-files-active-directory-overview'
 
     if ([string]::IsNullOrWhiteSpace($StorageAccountId)) {
         Add-IDNCheckResult -Category 'Storage' -CheckName 'Azure Files Identity' -Result 'SKIP' `
-            -Details 'No storage account selected. Pass -StorageAccountId to validate FSLogix storage identity.'
+            -Details 'No storage account selected. Pass -StorageAccountId to check Azure Files authentication for this model.'
         return $null
     }
     if (-not $script:ArmToken) {
@@ -1410,7 +1421,7 @@ function Test-IDNStorageIdentity {
     } else {
         Add-IDNCheckResult -Category 'Storage' -CheckName "Identity Source: $($sa.name)" -Result 'FAIL' `
             -Details "Configured: $($labels[$option]) | Required for this model: $($labels[$expected])" `
-            -Roadblock 'Users cannot mount the FSLogix profile share, so profiles fail to load at sign-in.' `
+            -Roadblock 'Users cannot mount the file share with their identity (for example, FSLogix profiles fail to load at sign-in).' `
             -HowToFix "Enable $($labels[$expected]) authentication on the storage account (Storage account > Data storage > File shares > Identity-based access). A storage account supports one identity source at a time." `
             -DocLink $filesDoc
     }
@@ -1431,8 +1442,8 @@ function Test-IDNStorageIdentity {
         } else {
             Add-IDNCheckResult -Category 'Storage' -CheckName "Share Permissions: $($sa.name)" -Result 'FAIL' `
                 -Details 'No Storage File Data SMB Share role is assigned and the default share permission is None.' `
-                -Roadblock 'Authenticated users are still refused at the share level, so FSLogix cannot attach profiles.' `
-                -HowToFix "Assign 'Storage File Data SMB Share Contributor' to the AVD users group on the storage account (or the share), and 'Elevated Contributor' to the admins who set NTFS permissions." `
+                -Roadblock 'Authenticated users are still refused at the share level, so the share cannot be mounted.' `
+                -HowToFix "Assign 'Storage File Data SMB Share Contributor' to the users group on the storage account (or the share), and 'Elevated Contributor' to the admins who set NTFS permissions." `
                 -DocLink 'https://learn.microsoft.com/azure/storage/files/storage-files-identity-assign-share-level-permissions'
         }
     } catch {
@@ -1447,7 +1458,7 @@ function Test-IDNSsoConfiguration {
     param([switch]$Enabled)
 
     Write-IDNSection -Title 'SINGLE SIGN-ON (MICROSOFT ENTRA AUTHENTICATION FOR RDP)'
-    $ssoDoc = 'https://learn.microsoft.com/azure/virtual-desktop/configure-single-sign-on'
+    $ssoDoc = 'https://learn.microsoft.com/entra/identity/devices/howto-vm-sign-in-azure-ad-windows'
 
     if (-not $Enabled) {
         Add-IDNCheckResult -Category 'SSO' -CheckName 'RDP Single Sign-On Configuration' -Result 'SKIP' `
@@ -1476,7 +1487,7 @@ function Test-IDNSsoConfiguration {
             } else {
                 Add-IDNCheckResult -Category 'SSO' -CheckName "RDP Protocol Enabled: $($app.Name)" -Result 'FAIL' `
                     -Details 'isRemoteDesktopProtocolEnabled is false' `
-                    -Roadblock 'Entra authentication for RDP (enablerdsaadauth) fails without it, so single sign-on to session hosts does not work.' `
+                    -Roadblock 'Microsoft Entra authentication for RDP fails without it, so single sign-on to Entra-joined machines does not work.' `
                     -HowToFix "Update-MgServicePrincipalRemoteDesktopSecurityConfiguration -ServicePrincipalId $($sp.id) -IsRemoteDesktopProtocolEnabled" `
                     -DocLink $ssoDoc
             }
@@ -1516,14 +1527,14 @@ function Test-IDNDomainConnectivity {
     }
 
     Add-IDNCheckResult -Category 'Domain' -CheckName 'Test Origin' -Result 'INFO' `
-        -Details "These tests run from '$env:COMPUTERNAME'. Session hosts need the same results from the session host subnet."
+        -Details "These tests run from '$env:COMPUTERNAME'. The machines that join the domain need the same results from their own subnet."
 
     try {
         $srv = @(Resolve-DnsName -Name "_ldap._tcp.dc._msdcs.$DomainName" -Type SRV -DnsOnly -ErrorAction Stop | Where-Object { $_.Type -eq 'SRV' })
     } catch {
         Add-IDNCheckResult -Category 'Domain' -CheckName "DC Locator: $DomainName" -Result 'WARN' `
             -Details "SRV record _ldap._tcp.dc._msdcs.$DomainName does not resolve from this host" `
-            -HowToFix 'Run this from a machine that uses the session host VNet DNS. If it still fails there, fix the DNS servers or forwarders for the AD zone.' `
+            -HowToFix 'Run this from a machine that uses the same VNet DNS as the machines that join. If it still fails there, fix the DNS servers or forwarders for the AD zone.' `
             -DocLink 'https://learn.microsoft.com/troubleshoot/windows-server/networking/verify-srv-dns-records-have-been-created'
         return
     }
@@ -1542,7 +1553,7 @@ function Test-IDNDomainConnectivity {
             } catch { $ok = $false } finally { if ($null -ne $client) { $client.Close() } }
             Add-IDNCheckResult -Category 'Domain' -CheckName "$($dc.NameTarget):$($p.Port)" -Result $(if ($ok) { 'PASS' } else { 'WARN' }) `
                 -Details $p.Name `
-                -HowToFix $(if (-not $ok) { "Allow TCP $($p.Port) from the session host subnet to the domain controllers (NSG, firewall, and the DC's Windows Firewall). Dynamic RPC ports 49152-65535 are also required." } else { '' }) `
+                -HowToFix $(if (-not $ok) { "Allow TCP $($p.Port) from the subnet of the machines to the domain controllers (NSG, firewall, and the DC's Windows Firewall). Dynamic RPC ports 49152-65535 are also required." } else { '' }) `
                 -DocLink $(if (-not $ok) { 'https://learn.microsoft.com/troubleshoot/windows-server/networking/service-overview-and-network-port-requirements' } else { '' })
         }
     }
@@ -1563,10 +1574,10 @@ function Test-IDNModelADDS {
 
     Write-IDNSection -Title 'AD DS ITEMS TO VERIFY ON-PREMISES (not readable from Azure)'
     Add-IDNCheckResult -Category 'ADDS' -CheckName 'Domain-Join Account and OU' -Result 'INFO' `
-        -Details 'The account that joins session hosts needs Create/Delete Computer objects on the target OU. On a domain-joined machine: (Get-Acl "AD:\OU=AVD,DC=corp,DC=contoso,DC=com").Access | Where-Object IdentityReference -like "*<account>*"' `
+        -Details 'The account that joins machines needs Create/Delete Computer objects on the target OU. On a domain-joined machine: (Get-Acl "AD:\OU=Computers,DC=corp,DC=contoso,DC=com").Access | Where-Object IdentityReference -like "*<account>*"' `
         -DocLink 'https://learn.microsoft.com/troubleshoot/windows-server/active-directory/access-denied-when-joining-computers'
     Add-IDNCheckResult -Category 'ADDS' -CheckName 'Hybrid Entra Join (recommended)' -Result 'INFO' `
-        -Details 'For Intune and SSO to cloud apps, session hosts should hybrid-join: the Service Connection Point must be configured in Entra Connect (Device options) and the OU must be in sync scope.' `
+        -Details 'For Intune and SSO to cloud apps, machines should hybrid-join: the Service Connection Point must be configured in Entra Connect (Device options) and the OU must be in sync scope.' `
         -DocLink 'https://learn.microsoft.com/entra/identity/devices/how-to-hybrid-join'
 
     $null = Test-IDNStorageIdentity -Model 'ADDS' -StorageAccountId $StorageAccountId
@@ -1592,7 +1603,7 @@ function Test-IDNModelEntraDS {
         if ($null -ne $group) {
             $members = @(Invoke-IDNGraphRequest -Uri "v1.0/groups/$($group.id)/members?`$select=id" -All)
             Add-IDNCheckResult -Category 'EntraDS' -CheckName 'AAD DC Administrators Group' -Result $(if ($members.Count -gt 0) { 'PASS' } else { 'WARN' }) `
-                -Details "$($members.Count) member(s). The account that joins session hosts must be a member." `
+                -Details "$($members.Count) member(s). The account that joins machines must be a member." `
                 -HowToFix $(if ($members.Count -eq 0) { 'Add the domain-join account (or its group) to AAD DC Administrators.' } else { '' })
         } else {
             Add-IDNCheckResult -Category 'EntraDS' -CheckName 'AAD DC Administrators Group' -Result 'WARN' `
@@ -1626,8 +1637,8 @@ function Test-IDNModelEntraDS {
         if ($null -eq $domain) {
             Add-IDNCheckResult -Category 'EntraDS' -CheckName 'Managed Domain' -Result 'FAIL' `
                 -Details $(if ($domains.Count) { "No managed domain named '$DomainName' (found: $((@($domains | ForEach-Object { $_.properties.domainName })) -join ', '))" } else { 'No Entra Domain Services managed domain in this subscription' }) `
-                -Roadblock 'Session hosts have no domain to join.' `
-                -HowToFix 'Create a managed domain (Entra admin center or Azure portal > Microsoft Entra Domain Services), in the session host region or a peered VNet.' `
+                -Roadblock 'Machines have no domain to join.' `
+                -HowToFix 'Create a managed domain (Entra admin center or Azure portal > Microsoft Entra Domain Services), in the region of the machines or a peered VNet.' `
                 -DocLink 'https://learn.microsoft.com/entra/identity/domain-services/tutorial-create-instance'
             return
         }
@@ -1656,13 +1667,13 @@ function Test-IDNModelEntraDS {
                 $_.properties.peeringState -eq 'Connected' -and [string]$_.properties.remoteVirtualNetwork.id -in $replicaVnets
             }).Count -gt 0
             if ($sameVnet -or $peered) {
-                Add-IDNCheckResult -Category 'EntraDS' -CheckName 'Session Host VNet to Managed Domain' -Result 'PASS' `
+                Add-IDNCheckResult -Category 'EntraDS' -CheckName 'VNet to Managed Domain' -Result 'PASS' `
                     -Details $(if ($sameVnet) { 'Same virtual network' } else { 'Connected peering to the managed domain VNet' })
             } else {
-                Add-IDNCheckResult -Category 'EntraDS' -CheckName 'Session Host VNet to Managed Domain' -Result 'FAIL' `
+                Add-IDNCheckResult -Category 'EntraDS' -CheckName 'VNet to Managed Domain' -Result 'FAIL' `
                     -Details "No connected peering from $($script:SelectedVNet.name) to the managed domain VNet" `
-                    -Roadblock 'Session hosts cannot reach the managed domain controllers.' `
-                    -HowToFix 'Peer the session host VNet with the Entra DS VNet in both directions (or route through a hub that reaches it).' `
+                    -Roadblock 'Machines cannot reach the managed domain controllers.' `
+                    -HowToFix 'Peer the VNet of the machines with the Entra DS VNet in both directions (or route through a hub that reaches it).' `
                     -DocLink 'https://learn.microsoft.com/entra/identity/domain-services/tutorial-configure-networking'
             }
         }
@@ -1675,7 +1686,7 @@ function Test-IDNModelEntraDS {
     if ($script:SyncEnabled -and $script:PhsEnabled -eq $false) {
         Add-IDNCheckResult -Category 'EntraDS' -CheckName 'Password Hashes for Synced Users' -Result 'FAIL' `
             -Details 'The tenant is synchronized but password hash sync is off.' `
-            -Roadblock 'Synced users have no password hash in the managed domain, so they cannot sign in to session hosts.' `
+            -Roadblock 'Synced users have no password hash in the managed domain, so they cannot sign in to domain-joined machines.' `
             -HowToFix 'Enable password hash synchronization in Entra Connect, then force a full password sync.' `
             -DocLink 'https://learn.microsoft.com/entra/identity/domain-services/tutorial-configure-password-hash-sync'
     }
@@ -1689,7 +1700,34 @@ function Test-IDNModelEntraDS {
 
 function Test-IDNEntraJoinSignIn {
     [CmdletBinding()]
-    param([Parameter(Mandatory=$true)] [string]$Category)
+    param(
+        [Parameter(Mandatory=$true)] [string]$Category,
+        [string]$SubscriptionId
+    )
+
+    # Users signing in to Entra-joined Azure VMs need one of these roles. Listed for the whole
+    # subscription (no atScope filter), so assignments on resource groups and VMs count too.
+    $vmRoleDoc = 'https://learn.microsoft.com/entra/identity/devices/howto-vm-sign-in-azure-ad-windows#configure-role-assignments-for-the-vm'
+    if ($SubscriptionId -and $script:ArmToken) {
+        try {
+            $assignments = @(Invoke-IDNArmRequest -Path "/subscriptions/$SubscriptionId/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" -All |
+                Where-Object { ([string]$_.properties.roleDefinitionId -split '/')[-1] -in @($script:RoleIds.VirtualMachineUserLogin, $script:RoleIds.VirtualMachineAdministratorLogin) })
+            if ($assignments.Count -gt 0) {
+                Add-IDNCheckResult -Category $Category -CheckName 'Azure VM Sign-In Roles' -Result 'PASS' `
+                    -Details "$($assignments.Count) Virtual Machine User Login or Administrator Login assignment(s) in the subscription" -DocLink $vmRoleDoc
+            } else {
+                Add-IDNCheckResult -Category $Category -CheckName 'Azure VM Sign-In Roles' -Result 'WARN' `
+                    -Details 'No Virtual Machine User Login or Virtual Machine Administrator Login assignment in the subscription.' `
+                    -HowToFix 'If users will sign in to Entra-joined Azure VMs, assign Virtual Machine User Login to their group on the VMs or their resource group. Not needed for physical devices.' `
+                    -DocLink $vmRoleDoc
+            }
+        } catch {
+            Add-IDNArmFailure -Category $Category -CheckName 'Azure VM Sign-In Roles' -ErrorRecord $_ -DocLink $vmRoleDoc
+        }
+    } else {
+        Add-IDNCheckResult -Category $Category -CheckName 'Azure VM Sign-In Roles' -Result 'SKIP' `
+            -Details 'No subscription selected; role assignments are read from Azure.' -DocLink $vmRoleDoc
+    }
 
     Test-IDNServicePrincipal -Category $Category -Name 'Azure Windows VM Sign-In' -AppId $script:AppIds.AzureWindowsVmSignIn -MissingResult 'INFO' `
         -HowToFix 'It appears after the first Entra sign-in to a VM; nothing to do unless Conditional Access must target it.' `
@@ -1700,8 +1738,8 @@ function Test-IDNEntraJoinSignIn {
         if ($mfa.Count -gt 0) {
             Add-IDNCheckResult -Category $Category -CheckName 'MFA on Azure Windows VM Sign-In' -Result 'WARN' `
                 -Details "$($mfa.Count) enforced polic(ies) require MFA for VM sign-in: $((@($mfa | ForEach-Object { $_.displayName })) -join '; ')" `
-                -HowToFix 'With MFA on this app, sign-in from clients that are not Entra joined fails unless single sign-on (enablerdsaadauth:i:1) is used. Enable SSO, or exclude Azure Windows VM Sign-In (372140e0-b3b7-4226-8ef9-d57986796201) and enforce MFA on Azure Virtual Desktop instead.' `
-                -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/set-up-mfa#microsoft-entra-joined-session-host-vms'
+                -HowToFix 'With MFA required on this app, RDP sign-in to Entra-joined Azure VMs from devices that are not Entra joined fails unless Entra single sign-on for RDP is used. Use single sign-on, or exclude Azure Windows VM Sign-In (372140e0-b3b7-4226-8ef9-d57986796201) and enforce MFA on the application users connect through.' `
+                -DocLink 'https://learn.microsoft.com/entra/identity/devices/howto-vm-sign-in-azure-ad-windows#using-conditional-access'
         } else {
             Add-IDNCheckResult -Category $Category -CheckName 'MFA on Azure Windows VM Sign-In' -Result 'PASS' `
                 -Details 'No enforced Conditional Access policy requires MFA on the VM sign-in itself'
@@ -1713,15 +1751,15 @@ function Test-IDNEntraJoinSignIn {
 
 function Test-IDNModelEntraID {
     [CmdletBinding()]
-    param([string]$StorageAccountId)
+    param([string]$SubscriptionId, [string]$StorageAccountId)
 
     Write-IDNSection -Title 'IDENTITY MODEL  -  MICROSOFT ENTRA ID'
 
     Add-IDNCheckResult -Category 'EntraID' -CheckName 'Domain Requirement' -Result 'INFO' `
-        -Details 'Session hosts are Entra joined by the AADLoginForWindows extension. No domain controller, domain-join account or line of sight to AD DS is needed.'
+        -Details 'Machines are Entra joined (Azure VMs through the AADLoginForWindows extension). No domain controller, domain-join account or line of sight to AD DS is needed.'
 
     Test-IDNVNetDns -Model 'EntraID'
-    Test-IDNEntraJoinSignIn -Category 'EntraID'
+    Test-IDNEntraJoinSignIn -Category 'EntraID' -SubscriptionId $SubscriptionId
 
     $sa = Test-IDNStorageIdentity -Model 'EntraID' -StorageAccountId $StorageAccountId
     if ($null -ne $sa -and $null -ne $script:TestUser -and -not [bool]$script:TestUser.onPremisesSyncEnabled) {
@@ -1738,13 +1776,13 @@ function Test-IDNModelEntraID {
 
 function Test-IDNModelEntraIDKerberos {
     [CmdletBinding()]
-    param([string]$StorageAccountId)
+    param([string]$SubscriptionId, [string]$StorageAccountId)
 
     Write-IDNSection -Title 'IDENTITY MODEL  -  MICROSOFT ENTRA ID WITH ENTRA KERBEROS'
     $kerbDoc = 'https://learn.microsoft.com/azure/storage/files/storage-files-identity-auth-hybrid-identities-enable'
 
     Test-IDNVNetDns -Model 'EntraIDKerberos'
-    Test-IDNEntraJoinSignIn -Category 'EntraIDKerberos'
+    Test-IDNEntraJoinSignIn -Category 'EntraIDKerberos' -SubscriptionId $SubscriptionId
 
     $sa = Test-IDNStorageIdentity -Model 'EntraIDKerberos' -StorageAccountId $StorageAccountId
     if ($null -ne $sa) {
@@ -1794,116 +1832,17 @@ function Test-IDNModelEntraIDKerberos {
         }
     }
 
-    Write-IDNSection -Title 'ENTRA KERBEROS ITEMS TO VERIFY ON THE HOSTS (not readable from Azure)'
+    Write-IDNSection -Title 'ENTRA KERBEROS ITEMS TO VERIFY ON THE MACHINES (not readable from Azure)'
     Add-IDNCheckResult -Category 'EntraIDKerberos' -CheckName 'Cloud Kerberos Ticket Retrieval' -Result 'INFO' `
-        -Details 'Session hosts must have CloudKerberosTicketRetrievalEnabled = 1 (Intune settings catalog: Kerberos > Cloud Kerberos Ticket Retrieval Enabled). Check on a host: Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters -Name CloudKerberosTicketRetrievalEnabled' `
+        -Details 'Machines must have CloudKerberosTicketRetrievalEnabled = 1 (Intune settings catalog: Kerberos > Cloud Kerberos Ticket Retrieval Enabled). Check on a host: Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters -Name CloudKerberosTicketRetrievalEnabled' `
         -DocLink "$kerbDoc#configure-the-clients-to-retrieve-kerberos-tickets"
     Add-IDNCheckResult -Category 'EntraIDKerberos' -CheckName 'Kerberos Server Object (on-premises SSO)' -Result 'INFO' `
-        -Details 'Only for SSO from session hosts to on-premises resources: create the Entra Kerberos server object in AD DS. Check with Get-AzureADKerberosServer (AzureADHybridAuthenticationManagement module).' `
+        -Details 'Only for SSO from these machines to on-premises resources: create the Entra Kerberos server object in AD DS. Check with Get-AzureADKerberosServer (AzureADHybridAuthenticationManagement module).' `
         -DocLink 'https://learn.microsoft.com/entra/identity/authentication/howto-authentication-passwordless-security-key-on-premises'
 }
 
 #endregion
 
-#region -- Product: Azure Virtual Desktop --------------------------------------
-
-function Test-IDNProductAVD {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$true)] [string]$Model,
-        [string]$SubscriptionId,
-        [string]$HostPoolId
-    )
-
-    Write-IDNSection -Title 'PRODUCT  -  AZURE VIRTUAL DESKTOP IDENTITY ITEMS'
-    $avdDoc = 'https://learn.microsoft.com/azure/virtual-desktop/prerequisites'
-
-    Test-IDNServicePrincipal -Category 'AVD' -Name 'Azure Virtual Desktop' -AppId $script:AppIds.AzureVirtualDesktop `
-        -Roadblock 'Host pool registration and session brokering fail without it.' `
-        -HowToFix 'Register the Microsoft.DesktopVirtualization resource provider in the subscription; that creates it.' -DocLink $avdDoc
-
-    if ($Model -in @('EntraID', 'EntraIDKerberos')) {
-        Test-IDNServicePrincipal -Category 'AVD' -Name 'Microsoft Remote Desktop' -AppId $script:AppIds.MicrosoftRemoteDesktop -MissingResult 'WARN' `
-            -HowToFix "New-MgServicePrincipal -AppId $($script:AppIds.MicrosoftRemoteDesktop)" `
-            -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/configure-single-sign-on'
-    }
-
-    if ([string]::IsNullOrWhiteSpace($HostPoolId) -or -not $script:ArmToken) {
-        Add-IDNCheckResult -Category 'AVD' -CheckName 'Host Pool Identity Settings' -Result 'SKIP' `
-            -Details 'No host pool selected. Pass -HostPoolId to check RDP sign-in properties, application group assignments and VM sign-in roles.'
-        return
-    }
-
-    try {
-        $pool = Invoke-IDNArmRequest -Path "$($HostPoolId)?api-version=2024-04-03"
-    } catch {
-        Add-IDNArmFailure -Category 'AVD' -CheckName 'Host Pool' -ErrorRecord $_ -DocLink $avdDoc
-        return
-    }
-
-    $rdp = [string]$pool.properties.customRdpProperty
-    if ($Model -in @('EntraID', 'EntraIDKerberos')) {
-        $sso = $rdp -match 'enablerdsaadauth:i:1'
-        $target = $rdp -match 'targetisaadjoined:i:1'
-        if ($sso) {
-            Add-IDNCheckResult -Category 'AVD' -CheckName "RDP Sign-In Property: $($pool.name)" -Result 'PASS' `
-                -Details 'enablerdsaadauth:i:1 (Microsoft Entra single sign-on)'
-        } elseif ($target) {
-            Add-IDNCheckResult -Category 'AVD' -CheckName "RDP Sign-In Property: $($pool.name)" -Result 'PASS' `
-                -Details 'targetisaadjoined:i:1 (password sign-in from clients that are not Entra joined; no SSO)'
-        } else {
-            Add-IDNCheckResult -Category 'AVD' -CheckName "RDP Sign-In Property: $($pool.name)" -Result 'FAIL' `
-                -Details 'Neither enablerdsaadauth:i:1 nor targetisaadjoined:i:1 is set' `
-                -Roadblock 'Users on devices that are not Entra joined (personal PCs, Macs, web) cannot sign in to Entra-joined session hosts.' `
-                -HowToFix 'Host pool > RDP Properties > Connection information: set Microsoft Entra single sign-on (enablerdsaadauth:i:1), or add targetisaadjoined:i:1 if SSO is not used.' `
-                -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/azure-ad-joined-session-hosts#connect-using-the-windows-desktop-client'
-        }
-
-        $rgScope = Get-IDNResourceGroupScope -ResourceId $HostPoolId
-        try {
-            $loginRoles = @(Get-IDNRoleAssignments -Scope $rgScope -RoleIds @($script:RoleIds.VirtualMachineUserLogin, $script:RoleIds.VirtualMachineAdministratorLogin))
-            if ($loginRoles.Count -gt 0) {
-                Add-IDNCheckResult -Category 'AVD' -CheckName 'VM Sign-In Roles (session host resource group)' -Result 'PASS' `
-                    -Details "$($loginRoles.Count) Virtual Machine User/Administrator Login assignment(s) at or above $rgScope"
-            } else {
-                Add-IDNCheckResult -Category 'AVD' -CheckName 'VM Sign-In Roles (session host resource group)' -Result 'FAIL' `
-                    -Details "No Virtual Machine User Login or Administrator Login assignment at or above $rgScope" `
-                    -Roadblock 'Entra-joined session hosts refuse sign-in for users without one of these roles.' `
-                    -HowToFix "Assign 'Virtual Machine User Login' to the AVD users group on the session host resource group (this check assumes session hosts share the host pool's resource group)." `
-                    -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/azure-ad-joined-session-hosts#assign-user-access-to-host-pools'
-            }
-        } catch {
-            Add-IDNArmFailure -Category 'AVD' -CheckName 'VM Sign-In Roles (session host resource group)' -ErrorRecord $_
-        }
-    } else {
-        Add-IDNCheckResult -Category 'AVD' -CheckName "RDP Sign-In Property: $($pool.name)" -Result 'INFO' `
-            -Details "Domain-joined session hosts authenticate with domain credentials. Custom RDP properties: $(if ($rdp) { $rdp } else { 'none' })"
-    }
-
-    try {
-        $groups = @(Invoke-IDNArmRequest -Path "/subscriptions/$SubscriptionId/providers/Microsoft.DesktopVirtualization/applicationGroups?api-version=2024-04-03" -All |
-            Where-Object { [string]$_.properties.hostPoolArmPath -eq [string]$pool.id })
-        if ($groups.Count -eq 0) {
-            Add-IDNCheckResult -Category 'AVD' -CheckName 'Application Groups' -Result 'WARN' `
-                -Details "No application group is linked to $($pool.name)" `
-                -HowToFix 'Create a desktop or RemoteApp application group for the host pool and register it in a workspace.' -DocLink $avdDoc
-        }
-        foreach ($group in $groups) {
-            $assigned = @(Get-IDNRoleAssignments -Scope ([string]$group.id) -RoleIds @($script:RoleIds.DesktopVirtualizationUser))
-            Add-IDNCheckResult -Category 'AVD' -CheckName "User Assignment: $($group.name)" -Result $(if ($assigned.Count -gt 0) { 'PASS' } else { 'FAIL' }) `
-                -Details "$($assigned.Count) Desktop Virtualization User assignment(s)" `
-                -Roadblock $(if ($assigned.Count -eq 0) { 'No user sees this application group in the client feed.' } else { '' }) `
-                -HowToFix $(if ($assigned.Count -eq 0) { 'Assign the AVD users group to the application group (Assignments), which grants Desktop Virtualization User.' } else { '' }) `
-                -DocLink 'https://learn.microsoft.com/azure/virtual-desktop/manage-app-groups'
-        }
-    } catch {
-        Add-IDNArmFailure -Category 'AVD' -CheckName 'Application Groups' -ErrorRecord $_
-    }
-}
-
-#endregion
-
-# ==============================================================================
 # INTERACTIVE SETUP WIZARD
 # ==============================================================================
 
@@ -1982,23 +1921,23 @@ function Invoke-IDNSetupWizard {
     Write-Host '  IDENTITY PROVISIONING  -  PREREQUISITES WIZARD' -ForegroundColor Cyan
     Write-Host "  $eq70" -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  This wizard checks, read-only, what your chosen identity model needs before' -ForegroundColor White
-    Write-Host '  you deploy: directory sync, domain services, DNS, storage identity, roles.' -ForegroundColor White
+    Write-Host '  This wizard checks, read-only, everything your chosen identity model needs:' -ForegroundColor White
+    Write-Host '  directory sync, domain services, DNS, Azure Files identity, sign-in roles.' -ForegroundColor White
     Write-Host ''
     Write-Host '  HOW TO USE THIS WIZARD' -ForegroundColor Cyan
-    Write-Host '  Answer 6 short questions. Press ENTER at any prompt to accept the' -ForegroundColor Gray
+    Write-Host '  Answer 4 short questions. Press ENTER at any prompt to accept the' -ForegroundColor Gray
     Write-Host '  suggested default shown in [square brackets].' -ForegroundColor Gray
     Write-Host ''
     $null = Read-Host '  Press ENTER to begin  '
 
     $config = [ordered]@{
         AuthMethod = 'Interactive'; Azure = $null; GraphAuthenticated = $false
-        IdentityModel = ''; Product = 'AVD'
-        VNetId = ''; StorageAccountId = ''; HostPoolId = ''; TestUserUpn = ''; DomainName = ''
+        IdentityModel = ''
+        VNetId = ''; StorageAccountId = ''; TestUserUpn = ''; DomainName = ''
     }
 
     # -- STEP 1: Sign in ---------------------------------------------------------
-    Write-IDNWizardHeader -Title 'STEP 1 of 6  -  SIGN IN'
+    Write-IDNWizardHeader -Title 'STEP 1 of 4  -  SIGN IN'
     Write-Host '  You sign in to Azure to list your tenants and subscriptions, then to' -ForegroundColor Gray
     Write-Host '  Microsoft Graph for the tenant you choose. Both are read-only.' -ForegroundColor Gray
     Write-Host '  How would you like to sign in?' -ForegroundColor Gray
@@ -2033,38 +1972,28 @@ function Invoke-IDNSetupWizard {
     if (-not $config.GraphAuthenticated) { throw 'Microsoft Graph sign-in did not complete.' }
     $null = Read-Host '  Press ENTER to continue  '
 
-    # -- STEP 4: Identity model ----------------------------------------------------
-    Write-IDNWizardHeader -Title 'STEP 4 of 6  -  IDENTITY MODEL'
-    Write-Host '  How will users and session hosts authenticate? Only this model is checked.' -ForegroundColor Gray
+    # -- STEP 2: Identity model ----------------------------------------------------
+    Write-IDNWizardHeader -Title 'STEP 2 of 4  -  IDENTITY MODEL'
+    Write-Host '  How will users and machines authenticate? Only this model is checked;' -ForegroundColor Gray
+    Write-Host '  run the script again to check another.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '  [1] Active Directory Domain Services (AD DS)' -ForegroundColor White
-    Write-Host '      Hosts join your AD domain; users are synced from AD DS to Entra ID.' -ForegroundColor DarkGray
+    Write-Host '      Machines join your AD domain; users are synced from AD DS to Entra ID.' -ForegroundColor DarkGray
     Write-Host '  [2] Microsoft Entra Domain Services' -ForegroundColor White
-    Write-Host '      Hosts join a Microsoft-managed domain built from Entra ID.' -ForegroundColor DarkGray
+    Write-Host '      Machines join a Microsoft-managed domain built from Entra ID.' -ForegroundColor DarkGray
     Write-Host '  [3] Microsoft Entra ID' -ForegroundColor White
-    Write-Host '      Hosts are Entra joined; no domain. Cloud-only or synced users.' -ForegroundColor DarkGray
+    Write-Host '      Machines are Entra joined; no domain. Cloud-only or synced users.' -ForegroundColor DarkGray
     Write-Host '  [4] Microsoft Entra ID with Entra Kerberos' -ForegroundColor White
-    Write-Host '      Entra-joined hosts, hybrid users, FSLogix on Azure Files via Entra Kerberos.' -ForegroundColor DarkGray
+    Write-Host '      Entra-joined machines, hybrid users, Azure Files through Entra Kerberos.' -ForegroundColor DarkGray
     Write-Host ''
     $config.IdentityModel = @('ADDS', 'EntraDS', 'EntraID', 'EntraIDKerberos')[(Get-IDNWizardMenuChoice -Min 1 -Max 4 -Default 3) - 1]
 
-    # -- STEP 5: Product ------------------------------------------------------------
-    Write-IDNWizardHeader -Title 'STEP 5 of 6  -  PRODUCT BEING DEPLOYED'
-    Write-Host '  The product adds its own identity items on top of the model.' -ForegroundColor Gray
-    Write-Host ''
-    Write-Host '  [1] Azure Virtual Desktop' -ForegroundColor White
-    Write-Host '      Service principal, host pool sign-in properties, VM sign-in roles,' -ForegroundColor DarkGray
-    Write-Host '      application group assignments, FSLogix storage identity.' -ForegroundColor DarkGray
-    Write-Host '  [2] None  -  identity model only' -ForegroundColor White
-    Write-Host ''
-    $config.Product = if ((Get-IDNWizardMenuChoice -Min 1 -Max 2 -Default 1) -eq 2) { 'None' } else { 'AVD' }
-
-    # -- STEP 6: Resources ------------------------------------------------------------
+    # -- STEP 3: Resources ------------------------------------------------------------
     $subId = $config.Azure.SubscriptionId
     if ($subId -and $script:ArmToken) {
         $needVnet = $config.IdentityModel -in @('ADDS', 'EntraDS')
-        Write-IDNWizardHeader -Title 'STEP 6 of 6  -  RESOURCES  (virtual network)'
-        Write-Host $(if ($needVnet) { '  The session host virtual network: DNS must reach the domain.' } else { '  The session host virtual network (optional for this model).' }) -ForegroundColor Gray
+        Write-IDNWizardHeader -Title 'STEP 3 of 4  -  RESOURCES  (virtual network)'
+        Write-Host $(if ($needVnet) { '  The virtual network the machines use: DNS must reach the domain.' } else { '  The virtual network the machines use (optional for this model).' }) -ForegroundColor Gray
         Write-Host ''
         try {
             $vnets = @(Invoke-IDNArmRequest -Path "/subscriptions/$subId/providers/Microsoft.Network/virtualNetworks?api-version=2023-09-01" -All | Sort-Object name)
@@ -2072,30 +2001,18 @@ function Invoke-IDNSetupWizard {
             if ($pick) { $config.VNetId = [string]$pick.id }
         } catch { Write-Host "  Could not list virtual networks: $($_.Exception.Message)" -ForegroundColor Yellow; $null = Read-Host '  Press ENTER to continue  ' }
 
-        if ($config.Product -eq 'AVD' -or $config.IdentityModel -eq 'EntraIDKerberos') {
-            Write-IDNWizardHeader -Title 'STEP 6 of 6  -  RESOURCES  (FSLogix storage account)'
-            Write-Host '  The Azure Files storage account that holds FSLogix profiles.' -ForegroundColor Gray
-            Write-Host ''
-            try {
-                $accounts = @(Invoke-IDNArmRequest -Path "/subscriptions/$subId/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" -All | Sort-Object name)
-                $pick = Select-IDNFromList -Items $accounts -Label { param($s) "{0}  ({1}, {2})" -f $s.name, $s.location, $s.kind } -SkipLabel 'Skip  -  do not check storage' -Kind 'storage accounts' -SkippedChecks 'The FSLogix storage identity and share permission checks' -SubscriptionName $config.Azure.SubscriptionName
-                if ($pick) { $config.StorageAccountId = [string]$pick.id }
-            } catch { Write-Host "  Could not list storage accounts: $($_.Exception.Message)" -ForegroundColor Yellow; $null = Read-Host '  Press ENTER to continue  ' }
-        }
-
-        if ($config.Product -eq 'AVD') {
-            Write-IDNWizardHeader -Title 'STEP 6 of 6  -  RESOURCES  (host pool)'
-            Write-Host '  The AVD host pool: RDP sign-in properties, application groups, VM roles.' -ForegroundColor Gray
-            Write-Host ''
-            try {
-                $pools = @(Invoke-IDNArmRequest -Path "/subscriptions/$subId/providers/Microsoft.DesktopVirtualization/hostPools?api-version=2024-04-03" -All | Sort-Object name)
-                $pick = Select-IDNFromList -Items $pools -Label { param($p) "{0}  ({1}, {2})" -f $p.name, $p.location, $p.properties.hostPoolType } -SkipLabel 'Skip  -  no host pool yet' -Kind 'AVD host pools' -SkippedChecks 'The RDP sign-in property, application group and VM sign-in role checks' -SubscriptionName $config.Azure.SubscriptionName
-                if ($pick) { $config.HostPoolId = [string]$pick.id }
-            } catch { Write-Host "  Could not list host pools: $($_.Exception.Message)" -ForegroundColor Yellow; $null = Read-Host '  Press ENTER to continue  ' }
-        }
+        Write-IDNWizardHeader -Title 'STEP 3 of 4  -  RESOURCES  (Azure Files storage account)'
+        Write-Host '  An Azure Files storage account whose users sign in with this model' -ForegroundColor Gray
+        Write-Host '  (for example, FSLogix profiles). Skip it if you do not use Azure Files.' -ForegroundColor Gray
+        Write-Host ''
+        try {
+            $accounts = @(Invoke-IDNArmRequest -Path "/subscriptions/$subId/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" -All | Sort-Object name)
+            $pick = Select-IDNFromList -Items $accounts -Label { param($s) "{0}  ({1}, {2})" -f $s.name, $s.location, $s.kind } -SkipLabel 'Skip  -  do not check storage' -Kind 'storage accounts' -SkippedChecks 'The Azure Files identity and share permission checks' -SubscriptionName $config.Azure.SubscriptionName
+            if ($pick) { $config.StorageAccountId = [string]$pick.id }
+        } catch { Write-Host "  Could not list storage accounts: $($_.Exception.Message)" -ForegroundColor Yellow; $null = Read-Host '  Press ENTER to continue  ' }
     }
 
-    Write-IDNWizardHeader -Title 'STEP 6 of 6  -  TEST USER'
+    Write-IDNWizardHeader -Title 'STEP 4 of 4  -  TEST USER'
     Write-Host '  A user who will sign in. The check confirms their identity source fits the model.' -ForegroundColor Gray
     Write-Host ''
     $me = [string](Get-MgContext).Account
@@ -2109,7 +2026,7 @@ function Invoke-IDNSetupWizard {
     }
 
     if ($config.IdentityModel -eq 'ADDS') {
-        Write-IDNWizardHeader -Title 'STEP 6 of 6  -  AD DS DOMAIN'
+        Write-IDNWizardHeader -Title 'STEP 4 of 4  -  AD DS DOMAIN'
         $suggested = ''
         if ($config.TestUserUpn) {
             try {
@@ -2169,12 +2086,10 @@ function Show-Banner {
     Write-Host "  TIMESTAMP       : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
     Write-Host ''
     Write-Host "  Identity model  : $($script:ModelNames[$IdentityModel])" -ForegroundColor White
-    Write-Host "  Product         : $Product" -ForegroundColor White
     if ($TenantId)         { Write-Host "  Tenant          : $TenantId" -ForegroundColor White }
     if ($SubscriptionId)   { Write-Host "  Subscription    : $SubscriptionId" -ForegroundColor White }
     if ($VNetId)           { Write-Host "  Virtual network : $(($VNetId -split '/')[-1])" -ForegroundColor White }
     if ($StorageAccountId) { Write-Host "  Storage account : $(($StorageAccountId -split '/')[-1])" -ForegroundColor White }
-    if ($HostPoolId)       { Write-Host "  Host pool       : $(($HostPoolId -split '/')[-1])" -ForegroundColor White }
     if ($TestUserUpn)      { Write-Host "  Test user       : $TestUserUpn" -ForegroundColor White }
     if ($DomainName)       { Write-Host "  AD DS domain    : $DomainName" -ForegroundColor White }
     Write-Host ''
@@ -2222,10 +2137,8 @@ try {
         $TenantId         = $wizCfg.Azure.TenantId
         $SubscriptionId   = $wizCfg.Azure.SubscriptionId
         $IdentityModel    = $wizCfg.IdentityModel
-        $Product          = $wizCfg.Product
         $VNetId           = $wizCfg.VNetId
         $StorageAccountId = $wizCfg.StorageAccountId
-        $HostPoolId       = $wizCfg.HostPoolId
         $TestUserUpn      = $wizCfg.TestUserUpn
         $DomainName       = $wizCfg.DomainName
         $graphReady       = [bool]$wizCfg.GraphAuthenticated
@@ -2265,7 +2178,7 @@ try {
             Write-IDNLog -Level 'PASS' -Message "Azure: $($azure.Account) | Tenant $($azure.TenantId) | Subscription $(if ($azure.SubscriptionId) { $azure.SubscriptionName } else { 'none' })"
         } catch {
             Add-IDNCheckResult -Category 'Authentication' -CheckName 'Azure Login' -Result 'FAIL' -Details $_.Exception.Message `
-                -Roadblock 'Azure resources (managed domain, VNet, storage, host pool) cannot be read.' `
+                -Roadblock 'Azure resources (managed domain, VNet, storage, role assignments) cannot be read.' `
                 -HowToFix 'Check the sign-in method and that the account can see the tenant and subscription.'
             throw 'Azure authentication failed. Aborting remaining checks.'
         }
@@ -2285,12 +2198,12 @@ try {
     Test-IDNGraphPermissions -RequiredScopes $graphScopes
     if (-not $script:ArmToken) {
         Add-IDNCheckResult -Category 'Authentication' -CheckName 'Azure Resource Checks' -Result 'SKIP' `
-            -Details 'No subscription selected: managed domain, VNet, storage and host pool checks will be skipped.'
+            -Details 'No subscription selected: managed domain, VNet, storage and Azure role checks will be skipped.'
     }
 
     if ($VNetId -and $script:ArmToken) {
         try { $script:SelectedVNet = Invoke-IDNArmRequest -Path "$($VNetId)?api-version=2023-09-01" }
-        catch { Add-IDNArmFailure -Category 'Network' -CheckName 'Session Host VNet' -ErrorRecord $_ }
+        catch { Add-IDNArmFailure -Category 'Network' -CheckName 'Virtual Network' -ErrorRecord $_ }
     }
 
     # -- STEP 4: Directory synchronization ----------------------------------------
@@ -2302,17 +2215,12 @@ try {
     switch ($IdentityModel) {
         'ADDS'            { Test-IDNTestUser -Model 'ADDS' -UserPrincipalName $TestUserUpn; Test-IDNModelADDS -DomainName $DomainName -StorageAccountId $StorageAccountId }
         'EntraDS'         { Test-IDNModelEntraDS -SubscriptionId $SubscriptionId -DomainName $DomainName -StorageAccountId $StorageAccountId; Test-IDNTestUser -Model 'EntraDS' -UserPrincipalName $TestUserUpn }
-        'EntraID'         { Test-IDNTestUser -Model 'EntraID' -UserPrincipalName $TestUserUpn; Test-IDNModelEntraID -StorageAccountId $StorageAccountId }
-        'EntraIDKerberos' { Test-IDNTestUser -Model 'EntraIDKerberos' -UserPrincipalName $TestUserUpn; Test-IDNModelEntraIDKerberos -StorageAccountId $StorageAccountId }
+        'EntraID'         { Test-IDNTestUser -Model 'EntraID' -UserPrincipalName $TestUserUpn; Test-IDNModelEntraID -SubscriptionId $SubscriptionId -StorageAccountId $StorageAccountId }
+        'EntraIDKerberos' { Test-IDNTestUser -Model 'EntraIDKerberos' -UserPrincipalName $TestUserUpn; Test-IDNModelEntraIDKerberos -SubscriptionId $SubscriptionId -StorageAccountId $StorageAccountId }
     }
 
-    # -- STEP 7: Product ----------------------------------------------------------
-    if ($Product -eq 'AVD') {
-        Test-IDNProductAVD -Model $IdentityModel -SubscriptionId $SubscriptionId -HostPoolId $HostPoolId
-    }
-
-    # -- STEP 8: Single sign-on ---------------------------------------------------
-    if ($IdentityModel -in @('EntraID', 'EntraIDKerberos') -or ($IdentityModel -eq 'ADDS' -and $Product -eq 'AVD')) {
+    # -- STEP 7: Single sign-on for RDP (Entra models) ----------------------------
+    if ($IdentityModel -in @('EntraID', 'EntraIDKerberos')) {
         Test-IDNSsoConfiguration -Enabled:$CheckSsoConfiguration
     }
 
