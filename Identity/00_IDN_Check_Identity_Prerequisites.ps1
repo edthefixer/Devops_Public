@@ -190,6 +190,33 @@ if ($Host.Name -eq 'Windows PowerShell ISE Host') {
     return
 }
 
+# Az and Microsoft.Graph ship different versions of the same sign-in assemblies, and a
+# PowerShell process cannot unload one to load the other. If a script run earlier in this
+# window left any of them loaded, continue in a clean process in this same window. A Graph
+# session opened on purpose (Microsoft.Graph.Authentication still loaded) is left alone,
+# and so is -PassThru, whose objects cannot cross the process boundary.
+if (-not $PassThru -and -not (Get-Module -Name 'Microsoft.Graph.Authentication') -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+    $leftoverSignIn = @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {
+        $_.GetName().Name -match '^(Microsoft\.Identity\.Client|Azure\.Identity|Azure\.Core|Microsoft\.Graph\.|Microsoft\.Azure\.PowerShell\.)'
+    })
+    if ($leftoverSignIn.Count -gt 0) {
+        $cleanParameters = @{}
+        foreach ($cleanKey in $PSBoundParameters.Keys) {
+            $cleanValue = $PSBoundParameters[$cleanKey]
+            if ($cleanValue -is [System.Management.Automation.SwitchParameter]) { $cleanValue = $cleanValue.IsPresent }
+            $cleanParameters[$cleanKey] = $cleanValue
+        }
+        $cleanParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
+        $cleanParameters | Export-Clixml -LiteralPath $cleanParameterFile -Force
+        $cleanCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p; exit `$LASTEXITCODE" -f $cleanParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
+        $cleanEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanCommand))
+        $cleanEngine = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
+        Write-Host 'Sign-in components from an earlier script are loaded in this window, so this script continues in a clean PowerShell process.' -ForegroundColor Yellow
+        $cleanProcess = Start-Process -FilePath $cleanEngine -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $cleanEncoded) -NoNewWindow -Wait -PassThru
+        exit $cleanProcess.ExitCode
+    }
+}
+
 Set-StrictMode -Off   # Disabled to preserve PS5.1 broad compatibility with optional properties
 $ErrorActionPreference = 'Continue'
 
