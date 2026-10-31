@@ -97,28 +97,6 @@ param(
     [switch]$AutoFixAll
 )
 
-# PowerShell ISE cannot show the console of a child process, and this script starts
-# one, so from ISE it reopens itself in a PowerShell window with the same parameters.
-if ($Host.Name -eq 'Windows PowerShell ISE Host') {
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        Write-Warning 'Save this script to a file, then run it from a PowerShell window.'
-        return
-    }
-    $iseParameters = @{}
-    foreach ($iseKey in $PSBoundParameters.Keys) {
-        $iseValue = $PSBoundParameters[$iseKey]
-        if ($iseValue -is [System.Management.Automation.SwitchParameter]) { $iseValue = $iseValue.IsPresent }
-        $iseParameters[$iseKey] = $iseValue
-    }
-    $iseParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
-    $iseParameters | Export-Clixml -LiteralPath $iseParameterFile -Force
-    $iseCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p" -f $iseParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
-    $iseEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($iseCommand))
-    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoLogo', '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $iseEncoded)
-    Write-Host 'PowerShell ISE cannot show this script''s output, so it continues in a new PowerShell window.' -ForegroundColor Yellow
-    return
-}
-
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 try {
@@ -143,50 +121,6 @@ function Expand-EmbeddedScript {
     $gzip = New-Object IO.Compression.GZipStream($inputStream, [IO.Compression.CompressionMode]::Decompress)
     $reader = New-Object IO.StreamReader($gzip, [Text.Encoding]::UTF8)
     try { $reader.ReadToEnd() } finally { $reader.Dispose(); $gzip.Dispose(); $inputStream.Dispose() }
-}
-
-function Protect-LauncherFile {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    try {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $security = New-Object Security.AccessControl.FileSecurity
-        $security.SetAccessRuleProtection($true, $false)
-        $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')))
-        $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'Allow')))
-        Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
-    } catch {
-        Write-Verbose "Could not restrict temporary file ACL: $($_.Exception.Message)"
-    }
-}
-
-$workerMode = $env:AVD02_EMBEDDED_WORKER -eq '1'
-if ($workerMode) {
-    $parameterFile = $env:AVD02_PARAMETER_FILE
-    $outputFile = $env:AVD02_OUTPUT_FILE
-    $errorFile = $env:AVD02_ERROR_FILE
-    $workerLanguage = $env:AVD02_WORKER_LANGUAGE
-    try {
-        if (-not $embeddedPayloads.ContainsKey($workerLanguage)) { throw "Unsupported worker language: $workerLanguage" }
-        $parameters = Import-Clixml -LiteralPath $parameterFile -ErrorAction Stop
-        $env:AVD_REPORT_SCRIPT_NAME = '02_AVD_Validate_Network_Configuration_Launcher'
-        $env:PSModulePath = (($env:PSModulePath -split [IO.Path]::PathSeparator) |
-            Where-Object { $_ -and $_ -notmatch '(?i)OneDrive|Documents[\\/](WindowsPowerShell|PowerShell)[\\/]Modules' }) -join [IO.Path]::PathSeparator
-        Set-Location -LiteralPath $PSScriptRoot
-        $source = Expand-EmbeddedScript -Payload $embeddedPayloads[$workerLanguage]
-        $engine = [scriptblock]::Create($source)
-        $global:LASTEXITCODE = 0
-        $result = & $engine @parameters
-        $workerExitCode = $global:LASTEXITCODE
-        if ($null -ne $result) {
-            $result | Export-Clixml -LiteralPath $outputFile -Depth 40 -Force
-            Protect-LauncherFile -Path $outputFile
-        }
-        exit $workerExitCode
-    } catch {
-        $_.Exception.Message | Set-Content -LiteralPath $errorFile -Encoding UTF8 -Force
-        Protect-LauncherFile -Path $errorFile
-        exit 2
-    }
 }
 
 if (-not $Language) {
@@ -223,54 +157,35 @@ if (-not $ReportPath) {
     $forwardParameters.ReportPath = Join-Path $PSScriptRoot ("02_AVD_Validate_Network_Configuration_Launcher_{0}.xlsx" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 
-# The engine, not the host: in PowerShell ISE this process is powershell_ise.exe.
-$powerShellExe = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
-if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
-    $powerShellExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
-}
-
-$operationId = [guid]::NewGuid().ToString('N')
-$parameterFile = Join-Path ([IO.Path]::GetTempPath()) "AVD02_Parameters_$operationId.clixml"
-$outputFile = Join-Path ([IO.Path]::GetTempPath()) "AVD02_Output_$operationId.clixml"
-$errorFile = Join-Path ([IO.Path]::GetTempPath()) "AVD02_Error_$operationId.txt"
-$workerTempPath = Join-Path ([IO.Path]::GetTempPath()) "AVD02_Temp_$operationId"
+# The engine runs in this PowerShell session, so the script behaves the same in Windows
+# PowerShell 5.1, PowerShell 7 and PowerShell ISE. For the run it works from the script's
+# folder, with its own temporary folder and a module path without the Documents and OneDrive
+# module folders; all three are restored when it finishes, whether it passes or fails.
+$engineTempPath = Join-Path ([IO.Path]::GetTempPath()) ("AVD02_Temp_{0}" -f [guid]::NewGuid().ToString('N'))
 $previousEnvironment = @{
-    Worker = $env:AVD02_EMBEDDED_WORKER
-    Parameters = $env:AVD02_PARAMETER_FILE
-    Output = $env:AVD02_OUTPUT_FILE
-    Error = $env:AVD02_ERROR_FILE
-    Language = $env:AVD02_WORKER_LANGUAGE
-    Temp = $env:TEMP
-    Tmp = $env:TMP
+    AVD_REPORT_SCRIPT_NAME = $env:AVD_REPORT_SCRIPT_NAME
+    PSModulePath = $env:PSModulePath
+    TEMP = $env:TEMP
+    TMP = $env:TMP
 }
+$previousLocation = Get-Location
 try {
-    New-Item -ItemType Directory -Path $workerTempPath -ErrorAction Stop | Out-Null
-    $forwardParameters | Export-Clixml -LiteralPath $parameterFile -Depth 20 -Force
-    Protect-LauncherFile -Path $parameterFile
-    $env:AVD02_EMBEDDED_WORKER = '1'
-    $env:AVD02_PARAMETER_FILE = $parameterFile
-    $env:AVD02_OUTPUT_FILE = $outputFile
-    $env:AVD02_ERROR_FILE = $errorFile
-    $env:AVD02_WORKER_LANGUAGE = $normalizedLanguage
-    $env:TEMP = $workerTempPath
-    $env:TMP = $workerTempPath
-    $child = Start-Process -FilePath $powerShellExe -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) -Wait -PassThru -NoNewWindow
-    $global:LASTEXITCODE = $child.ExitCode
-    if (Test-Path -LiteralPath $outputFile -PathType Leaf) { Import-Clixml -LiteralPath $outputFile }
-    if ($child.ExitCode -ne 0) {
-        $detail = if (Test-Path -LiteralPath $errorFile -PathType Leaf) { Get-Content -LiteralPath $errorFile -Raw } else { "Embedded validation worker exited with code $($child.ExitCode)." }
-        Write-Host ("Validation failed: {0}" -f $detail.Trim()) -ForegroundColor Red
-    }
+    New-Item -ItemType Directory -Path $engineTempPath -ErrorAction Stop | Out-Null
+    $env:AVD_REPORT_SCRIPT_NAME = '02_AVD_Validate_Network_Configuration_Launcher'
+    $env:PSModulePath = (($env:PSModulePath -split [IO.Path]::PathSeparator) |
+        Where-Object { $_ -and $_ -notmatch '(?i)OneDrive|Documents[\\/](WindowsPowerShell|PowerShell)[\\/]Modules' }) -join [IO.Path]::PathSeparator
+    $env:TEMP = $engineTempPath
+    $env:TMP = $engineTempPath
+    Set-Location -LiteralPath $PSScriptRoot
+    $engine = [scriptblock]::Create((Expand-EmbeddedScript -Payload $embeddedPayloads[$normalizedLanguage]))
+    $global:LASTEXITCODE = 0
+    & $engine @forwardParameters
 } finally {
-    foreach ($path in @($parameterFile, $outputFile, $errorFile)) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$path)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-    }
-    if (Test-Path -LiteralPath $workerTempPath) {
-        Remove-Item -LiteralPath $workerTempPath -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    $environmentMap = @{AVD02_EMBEDDED_WORKER='Worker';AVD02_PARAMETER_FILE='Parameters';AVD02_OUTPUT_FILE='Output';AVD02_ERROR_FILE='Error';AVD02_WORKER_LANGUAGE='Language';TEMP='Temp';TMP='Tmp'}
-    foreach ($name in $environmentMap.Keys) {
-        $value = $previousEnvironment[$environmentMap[$name]]
+    Set-Location -LiteralPath $previousLocation.Path
+    foreach ($name in $previousEnvironment.Keys) {
+        $value = $previousEnvironment[$name]
         if ($null -eq $value) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue } else { Set-Item "Env:$name" $value }
     }
+    # Modules the engine loaded from here stay locked until PowerShell closes; what can be removed is.
+    Remove-Item -LiteralPath $engineTempPath -Recurse -Force -ErrorAction SilentlyContinue
 }

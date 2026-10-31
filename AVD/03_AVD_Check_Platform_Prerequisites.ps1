@@ -261,28 +261,6 @@ param(
     [string]$ReportPath
 )
 
-# PowerShell ISE cannot show the console of a child process, and this script starts
-# one, so from ISE it reopens itself in a PowerShell window with the same parameters.
-if ($Host.Name -eq 'Windows PowerShell ISE Host') {
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        Write-Warning 'Save this script to a file, then run it from a PowerShell window.'
-        return
-    }
-    $iseParameters = @{}
-    foreach ($iseKey in $PSBoundParameters.Keys) {
-        $iseValue = $PSBoundParameters[$iseKey]
-        if ($iseValue -is [System.Management.Automation.SwitchParameter]) { $iseValue = $iseValue.IsPresent }
-        $iseParameters[$iseKey] = $iseValue
-    }
-    $iseParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
-    $iseParameters | Export-Clixml -LiteralPath $iseParameterFile -Force
-    $iseCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p" -f $iseParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
-    $iseEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($iseCommand))
-    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoLogo', '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $iseEncoded)
-    Write-Host 'PowerShell ISE cannot show this script''s output, so it continues in a new PowerShell window.' -ForegroundColor Yellow
-    return
-}
-
 # Embedded standalone module lifecycle; no companion helper is required.
 $script:AVDTempPath = $null
 $script:AVDTempModuleNames = [System.Collections.Generic.List[string]]::new()
@@ -671,42 +649,18 @@ function Invoke-ComprehensiveReadinessAssessment {
         }
     }
 
-    $parameterFile = Join-Path ([IO.Path]::GetTempPath()) ("AVD03_AssessmentParameters_{0}.clixml" -f [guid]::NewGuid().ToString('N'))
-    $resultFile = Join-Path ([IO.Path]::GetTempPath()) ("AVD03_AssessmentResult_{0}.clixml" -f [guid]::NewGuid().ToString('N'))
-    # The engine, not the host: in PowerShell ISE this process is powershell_ise.exe.
-    $powerShellExe = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
-    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
-        $powerShellExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
+    # 00 runs in this PowerShell session and reuses this script's Azure sign-in (ExistingContext).
+    $global:LASTEXITCODE = 0
+    $output = @(& $assessmentScript @assessmentParameters)
+    $assessmentExitCode = $global:LASTEXITCODE
+    $assessmentSummary = $output | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Results'] } | Select-Object -Last 1
+
+    if ($assessmentExitCode -eq 2 -or $null -eq $assessmentSummary) {
+        throw "The comprehensive assessment did not complete successfully (exit code $assessmentExitCode)."
     }
 
-    try {
-        $assessmentParameters | Export-Clixml -LiteralPath $parameterFile -Force
-        $escapedAssessmentScript = $assessmentScript.Replace("'", "''")
-        $escapedParameterFile = $parameterFile.Replace("'", "''")
-        $escapedResultFile = $resultFile.Replace("'", "''")
-        $childCommand = @"
-`$parameters = Import-Clixml -LiteralPath '$escapedParameterFile'
-`$global:LASTEXITCODE = 0
-`$output = @(& '$escapedAssessmentScript' @parameters)
-`$summary = `$output | Where-Object { `$null -ne `$_.PSObject.Properties['Results'] } | Select-Object -Last 1
-if (`$null -ne `$summary) { `$summary | Export-Clixml -LiteralPath '$escapedResultFile' -Force }
-exit `$global:LASTEXITCODE
-"@
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCommand))
-        $child = Start-Process -FilePath $powerShellExe `
-            -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand) `
-            -Wait -PassThru -NoNewWindow
-
-        if ($child.ExitCode -eq 2 -or -not (Test-Path -LiteralPath $resultFile -PathType Leaf)) {
-            throw "The comprehensive assessment did not complete successfully (exit code $($child.ExitCode))."
-        }
-
-        $assessmentSummary = Import-Clixml -LiteralPath $resultFile
-        Import-ComprehensiveAssessmentFindings -AssessmentSummary $assessmentSummary
-        return $assessmentSummary
-    } finally {
-        Remove-Item -LiteralPath $parameterFile, $resultFile -Force -ErrorAction SilentlyContinue
-    }
+    Import-ComprehensiveAssessmentFindings -AssessmentSummary $assessmentSummary
+    return $assessmentSummary
 }
 
 function Show-GuidedRemediationPlan {

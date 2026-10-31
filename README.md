@@ -44,7 +44,7 @@ Downloaded scripts may need to be allowed for the current session:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-In **PowerShell ISE**, type that line in the console pane before pressing F5, and open the script from its file rather than pasting it into a new tab. The script then continues in a new PowerShell window, because ISE cannot show its output.
+Every script runs in the window you start it from: Windows PowerShell 5.1, PowerShell 7 or **PowerShell ISE**. In ISE, type that line in the console pane before pressing F5, and open the script from its file rather than pasting it into a new tab.
 
 ## Signing in
 
@@ -149,7 +149,7 @@ To preview the safe changes without making them: `-RemediationMode Guided -Apply
 
 ### `00_INT_Check_Deployment_Readiness.ps1`
 
-Microsoft Intune deployment readiness in twelve areas: PowerShell environment, Graph sign-in and permissions, tenant and MDM authority, licensing, device registration and automatic enrollment, enrollment restrictions, compliance and configuration policies for the chosen platforms, optional Windows Autopilot, Apple and Android connectors, Conditional Access that requires a compliant device, admin roles, and endpoint connectivity. Read-only: it only reads from Microsoft Graph. Its sign-in lasts for the run only and leaves other sessions on the computer alone. English.
+Microsoft Intune deployment readiness in twelve areas: PowerShell environment, Graph sign-in and permissions, tenant and MDM authority, licensing, device registration and automatic enrollment, enrollment restrictions, compliance and configuration policies for the chosen platforms, optional Windows Autopilot, Apple and Android connectors, Conditional Access that requires a compliant device, admin roles, and endpoint connectivity. Read-only: it only reads from Microsoft Graph. The guided setup shows the tenant you signed in to, and lets you continue with it or name another by its domain. Its sign-in lasts for the run only and leaves other sessions on the computer alone. English.
 
 ```powershell
 .\Intune\00_INT_Check_Deployment_Readiness.ps1 `
@@ -167,7 +167,7 @@ Every prerequisite Microsoft documents for one identity model, the way users and
 
 It checks directory synchronization, whether a test user has the right identity source, and the model's own dependencies: domain and DNS, Azure Files identity, sign-in roles and Conditional Access, as the model requires. `-CheckSsoConfiguration` adds single sign-on for RDP. Anything that cannot be read from Azure or Graph is reported with the exact command to check it by hand. Product-specific identity items, such as an AVD host pool's sign-in settings, are checked by that product's script.
 
-The Excel report opens on a **Summary** sheet: the model checked, the tenant, who ran it and when, the verdict and the counts. Every requirement after it links to the Microsoft documentation it comes from, so it can be checked against the source. Read-only. Its sign-in lasts for the run only and leaves other sessions on the computer alone. English.
+The Excel report opens on a **Summary** sheet: the model checked, the tenant, who ran it and when, the verdict and the counts. Every requirement after it links to the Microsoft documentation it comes from, so it can be checked against the source. Read-only. One Azure sign-in reads both Azure and Microsoft Graph. It lasts for the run only: nothing is saved to disk, and an Azure PowerShell sign-in the window already had is put back afterwards. English.
 
 ```powershell
 .\Identity\00_IDN_Check_Identity_Prerequisites.ps1 `

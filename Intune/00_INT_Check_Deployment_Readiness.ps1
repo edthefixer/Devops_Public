@@ -160,55 +160,6 @@ param(
     [switch]$SkipModuleValidation
 )
 
-# PowerShell ISE cannot show the console of a child process, and this script starts
-# one, so from ISE it reopens itself in a PowerShell window with the same parameters.
-if ($Host.Name -eq 'Windows PowerShell ISE Host') {
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        Write-Warning 'Save this script to a file, then run it from a PowerShell window.'
-        return
-    }
-    $iseParameters = @{}
-    foreach ($iseKey in $PSBoundParameters.Keys) {
-        $iseValue = $PSBoundParameters[$iseKey]
-        if ($iseValue -is [System.Management.Automation.SwitchParameter]) { $iseValue = $iseValue.IsPresent }
-        $iseParameters[$iseKey] = $iseValue
-    }
-    $iseParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
-    $iseParameters | Export-Clixml -LiteralPath $iseParameterFile -Force
-    $iseCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p" -f $iseParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
-    $iseEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($iseCommand))
-    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoLogo', '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $iseEncoded)
-    Write-Host 'PowerShell ISE cannot show this script''s output, so it continues in a new PowerShell window.' -ForegroundColor Yellow
-    return
-}
-
-# Az and Microsoft.Graph ship different versions of the same sign-in assemblies, and a
-# PowerShell process cannot unload one to load the other. If a script run earlier in this
-# window left any of them loaded, continue in a clean process in this same window. A Graph
-# session opened on purpose (Microsoft.Graph.Authentication still loaded) is left alone,
-# and so is -PassThru, whose objects cannot cross the process boundary.
-if (-not $PassThru -and -not (Get-Module -Name 'Microsoft.Graph.Authentication') -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
-    $leftoverSignIn = @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {
-        $_.GetName().Name -match '^(Microsoft\.Identity\.Client|Azure\.Identity|Azure\.Core|Microsoft\.Graph\.|Microsoft\.Azure\.PowerShell\.)'
-    })
-    if ($leftoverSignIn.Count -gt 0) {
-        $cleanParameters = @{}
-        foreach ($cleanKey in $PSBoundParameters.Keys) {
-            $cleanValue = $PSBoundParameters[$cleanKey]
-            if ($cleanValue -is [System.Management.Automation.SwitchParameter]) { $cleanValue = $cleanValue.IsPresent }
-            $cleanParameters[$cleanKey] = $cleanValue
-        }
-        $cleanParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
-        $cleanParameters | Export-Clixml -LiteralPath $cleanParameterFile -Force
-        $cleanCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p; exit `$LASTEXITCODE" -f $cleanParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
-        $cleanEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanCommand))
-        $cleanEngine = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
-        Write-Host 'Sign-in components from an earlier script are loaded in this window, so this script continues in a clean PowerShell process.' -ForegroundColor Yellow
-        $cleanProcess = Start-Process -FilePath $cleanEngine -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $cleanEncoded) -NoNewWindow -Wait -PassThru
-        exit $cleanProcess.ExitCode
-    }
-}
-
 Set-StrictMode -Off   # Disabled to preserve PS5.1 broad compatibility with optional properties
 $ErrorActionPreference = 'Continue'
 
@@ -656,6 +607,11 @@ function Invoke-INTFreshProcessRecovery {
 
     # Avoid infinite relaunch loops.
     if ($env:INT00_FRESH_PROCESS_RETRY -eq '1') {
+        return $false
+    }
+
+    # PowerShell ISE cannot show a child process, so there the import error is reported instead.
+    if ($Host.Name -eq 'Windows PowerShell ISE Host') {
         return $false
     }
 
@@ -1879,94 +1835,17 @@ function Invoke-INTWizardSignIn {
     return (Get-MgContext -ErrorAction Stop)
 }
 
-function Get-INTAzAccountsModulePath {
+function Get-INTSignedInTenant {
     [CmdletBinding()]
     param()
-
-    $local = Resolve-INTBestLocalModule -Name 'Az.Accounts' -MinimumVersion ([version]'2.12.0')
-    if ($local) { return $local.Path }
-
-    if (-not (Get-Command -Name Save-Module -ErrorAction SilentlyContinue)) {
-        throw 'Az.Accounts is not installed and Save-Module is unavailable.'
-    }
-    $tempPath = Get-INTModuleTempPath
-    if ($preflight_Result -and -not $preflight_Result.TempPath) { $preflight_Result.TempPath = $tempPath }
-    Write-Host '  Fetching Az.Accounts to temporary storage (used only to list your tenants)...' -ForegroundColor DarkGray
-    Save-Module -Name 'Az.Accounts' -MinimumVersion '2.12.0' -Path $tempPath -Force -ErrorAction Stop
-    $manifest = Get-ChildItem -Path (Join-Path $tempPath 'Az.Accounts') -Filter 'Az.Accounts.psd1' -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $manifest) { throw 'Az.Accounts manifest not found after Save-Module completed.' }
-    return $manifest.FullName
-}
-
-function Get-INTAzTenantList {
-    [CmdletBinding()]
-    param([Parameter(Mandatory=$true)] [string]$Method)
-
-    # Runs in a short-lived child process: Az.Accounts and Microsoft.Graph ship
-    # different versions of the same identity assemblies and cannot share one
-    # process. The child keeps its Azure session in memory only and exits.
-    $childScript = @'
-$ErrorActionPreference = 'Stop'
-try {
-    Import-Module -Name $env:INT00_AZ_MODULE -ErrorAction Stop -WarningAction SilentlyContinue
-    Disable-AzContextAutosave -Scope Process | Out-Null
-    $connectParams = @{ Scope = 'Process'; SkipContextPopulation = $true; ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
-    if ($env:INT00_AZ_DEVICECODE -eq '1') { $connectParams['UseDeviceAuthentication'] = $true }
-    Connect-AzAccount @connectParams | Out-Null
-    $tenants = @(Get-AzTenant -ErrorAction Stop -WarningAction SilentlyContinue | ForEach-Object {
-        [pscustomobject]@{
-            Id            = [string]$_.Id
-            Name          = [string]$_.Name
-            DefaultDomain = [string]$_.DefaultDomain
-        }
-    })
-    ConvertTo-Json -InputObject $tenants -Depth 3 | Set-Content -LiteralPath $env:INT00_TENANT_FILE -Encoding UTF8
-    Disconnect-AzAccount -Scope Process -ErrorAction SilentlyContinue | Out-Null
-    exit 0
-} catch {
-    $_.Exception.Message | Set-Content -LiteralPath $env:INT00_TENANT_ERROR -Encoding UTF8
-    exit 1
-}
-'@
-
-    $modulePath = Get-INTAzAccountsModulePath
-    $operationId = [guid]::NewGuid().ToString('N')
-    $tenantFile = Join-Path ([IO.Path]::GetTempPath()) "INT00_Tenants_$operationId.json"
-    $errorFile = Join-Path ([IO.Path]::GetTempPath()) "INT00_TenantsError_$operationId.txt"
-
-    # Same engine as this session (pwsh -> pwsh, powershell -> powershell), resolved
-    # from $PSHOME: in PowerShell ISE this process is powershell_ise.exe.
-    $pwshExe = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
-    if ([string]::IsNullOrWhiteSpace($pwshExe) -or -not (Test-Path -Path $pwshExe)) {
-        $pwshExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell.exe' }
-    }
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-
-    $previous = @{
-        Module = $env:INT00_AZ_MODULE; DeviceCode = $env:INT00_AZ_DEVICECODE
-        File = $env:INT00_TENANT_FILE; Error = $env:INT00_TENANT_ERROR
-    }
+    # Name and default domain of the tenant the Graph session is signed in to.
     try {
-        $env:INT00_AZ_MODULE = $modulePath
-        $env:INT00_AZ_DEVICECODE = if ($Method -eq 'DeviceCode') { '1' } else { '0' }
-        $env:INT00_TENANT_FILE = $tenantFile
-        $env:INT00_TENANT_ERROR = $errorFile
-        $child = Start-Process -FilePath $pwshExe -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -Wait -PassThru -NoNewWindow
-
-        if ($child.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $tenantFile)) {
-            $detail = if (Test-Path -LiteralPath $errorFile) { (Get-Content -LiteralPath $errorFile -Raw).Trim() } else { "exit code $($child.ExitCode)" }
-            throw "Azure sign-in to list tenants did not complete: $detail"
-        }
-        # PS 5.1 returns a JSON array as one object; enumerate it explicitly.
-        $parsed = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $tenantFile -Raw)
-        return @($parsed | ForEach-Object { $_ } | Sort-Object Name)
-    } finally {
-        Remove-Item -LiteralPath $tenantFile, $errorFile -Force -ErrorAction SilentlyContinue
-        $env:INT00_AZ_MODULE = $previous.Module
-        $env:INT00_AZ_DEVICECODE = $previous.DeviceCode
-        $env:INT00_TENANT_FILE = $previous.File
-        $env:INT00_TENANT_ERROR = $previous.Error
+        $org = Invoke-MgGraphRequest -Method GET -Uri 'v1.0/organization?$select=displayName,verifiedDomains' -OutputType PSObject -ErrorAction Stop
+        $first = @($org.value)[0]
+        $domain = @($first.verifiedDomains | Where-Object { $_.isDefault })[0].name
+        return [PSCustomObject]@{ Name = [string]$first.displayName; DefaultDomain = [string]$domain }
+    } catch {
+        return [PSCustomObject]@{ Name = ''; DefaultDomain = '' }
     }
 }
 
@@ -2017,8 +1896,8 @@ function Invoke-INTSetupWizard {
     Write-Host "  $line70" -ForegroundColor White
     Write-Host ''
     Write-Host '  To assess your tenant, this tool needs to read its settings. You sign in' -ForegroundColor Gray
-    Write-Host '  once to list the tenants your account belongs to, and the tool then signs' -ForegroundColor Gray
-    Write-Host '  in to the one you choose with read-only permissions.' -ForegroundColor Gray
+    Write-Host '  to Microsoft Graph with read-only permissions, then confirm the tenant on' -ForegroundColor Gray
+    Write-Host '  the next screen.' -ForegroundColor Gray
     Write-Host '  How would you like to sign in?' -ForegroundColor Gray
     Write-Host ''
     Write-Host '  [1] Open a browser window to sign in (recommended for most users)' -ForegroundColor White
@@ -2042,7 +1921,6 @@ function Invoke-INTSetupWizard {
     }
 
     $ctx = $null
-    $tenants = @()
     try {
         if (-not $SkipModuleValidation) { Import-INTRequiredModulesToMemory -Modules $RequiredModules }
 
@@ -2069,24 +1947,24 @@ function Invoke-INTSetupWizard {
         if ($null -eq $ctx) {
             Write-Host ''
             if ($config.AuthMethod -eq 'DeviceCode') {
-                Write-Host '  Starting device code sign-in to list your tenants...' -ForegroundColor Cyan
+                Write-Host '  Starting device code sign-in...' -ForegroundColor Cyan
                 Write-Host '  Follow the instructions below to visit the URL and enter the code shown.' -ForegroundColor Gray
                 Write-Host ''
             } else {
                 Write-Host '  Opening browser window  -  please complete the sign-in in your browser...' -ForegroundColor Cyan
             }
-            $tenants = @(Get-INTAzTenantList -Method $config.AuthMethod)
-            Write-Host "  Signed in. Your account belongs to $($tenants.Count) tenant(s)." -ForegroundColor Green
+            $ctx = Invoke-INTWizardSignIn -Method $config.AuthMethod -Scopes $Scopes
+            $config.WizardAuthenticated = $true
         }
     } catch {
         Write-Host ''
-        Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host '  You can still enter a tenant ID or domain on the next screen.' -ForegroundColor Yellow
+        Write-Host "  Sign-in did not complete: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host '  You can still enter a tenant domain or ID on the next screen.' -ForegroundColor Yellow
         $null = Read-Host '  Press ENTER to continue  '
     }
 
     # =========================================================================
-    # STEP 2  -  SELECT TENANT
+    # STEP 2  -  CONFIRM TENANT
     # =========================================================================
     Clear-Host
     Write-Host ''
@@ -2095,56 +1973,45 @@ function Invoke-INTSetupWizard {
     Write-Host "  $line70" -ForegroundColor White
     Write-Host ''
     Write-Host '  A tenant is your organization in Microsoft 365 and Entra ID: it holds your' -ForegroundColor Gray
-    Write-Host '  users, devices and Intune settings. Select the tenant to assess.' -ForegroundColor Gray
+    Write-Host '  users, devices and Intune settings.' -ForegroundColor Gray
     Write-Host ''
 
     $selectedTenant = ''
+    $otherTenant = $false
     if ($null -ne $ctx) {
-        # Reused session: it is already bound to one tenant.
-        $selectedTenant = [string]$ctx.TenantId
-        Write-Host '  Using the tenant of your existing session:' -ForegroundColor White
-        Write-Host "  ID: $selectedTenant" -ForegroundColor DarkGray
-    } else {
-        if ($tenants.Count -eq 1) {
-            $selectedTenant = $tenants[0].Id
-            Write-Host '  Only one tenant found  -  automatically selected:' -ForegroundColor Green
-            Write-Host "  $($tenants[0].Name)  ($($tenants[0].DefaultDomain))" -ForegroundColor White
-            Write-Host "  ID: $($tenants[0].Id)" -ForegroundColor DarkGray
+        $tenantInfo = Get-INTSignedInTenant
+        Write-Host "  Signed in as : $(if ($ctx.Account) { $ctx.Account } else { "app $($ctx.AppName)" })" -ForegroundColor White
+        Write-Host "  Tenant       : $(if ($tenantInfo.Name) { "$($tenantInfo.Name)  ($($tenantInfo.DefaultDomain))" } else { $ctx.TenantId })" -ForegroundColor White
+        Write-Host "  ID: $($ctx.TenantId)" -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '  [1] Continue with this tenant' -ForegroundColor White
+        Write-Host '  [2] Another tenant  (you will type its domain, for example contoso.com)' -ForegroundColor White
+        Write-Host ''
+        if ((Get-INTWizardMenuChoice -Min 1 -Max 2 -Default 1) -eq 1) {
+            $selectedTenant = [string]$ctx.TenantId
         } else {
-            if ($tenants.Count -gt 1) {
-                Write-Host '  Your tenants:' -ForegroundColor White
-                Write-Host ''
-                for ($i = 0; $i -lt $tenants.Count; $i++) {
-                    Write-Host ("  [{0,2}] {1}  ({2})" -f ($i + 1), $tenants[$i].Name, $tenants[$i].DefaultDomain) -ForegroundColor White
-                    Write-Host ("        ID: {0}" -f $tenants[$i].Id) -ForegroundColor DarkGray
-                }
-            }
-            $manualChoice = $tenants.Count + 1
-            Write-Host ''
-            Write-Host ("  [{0,2}] Enter a tenant ID or domain manually" -f $manualChoice) -ForegroundColor DarkGray
-            Write-Host ''
-            $tenantChoice = Get-INTWizardMenuChoice `
-                -Prompt '  Enter the number of the tenant to assess' `
-                -Min 1 -Max $manualChoice -Default 1
-            if ($tenantChoice -eq $manualChoice) {
-                Write-Host ''
-                $selectedTenant = (Read-Host '  Tenant ID or domain (e.g. contoso.onmicrosoft.com)').Trim()
-            } else {
-                $selectedTenant = $tenants[$tenantChoice - 1].Id
-                Write-Host ''
-                Write-Host "  Selected: $($tenants[$tenantChoice - 1].Name)" -ForegroundColor Green
-            }
+            $otherTenant = $true
         }
+    } else {
+        $otherTenant = $true
+    }
 
+    if ($otherTenant) {
+        Write-Host ''
+        $selectedTenant = (Read-Host '  Tenant domain or ID (for example contoso.com)').Trim()
         if ($selectedTenant) {
+            if ($config.AuthMethod -eq 'ExistingContext') { $config.AuthMethod = 'Interactive' }
             Write-Host ''
             Write-Host '  Signing in to Microsoft Graph for this tenant (read-only permissions)...' -ForegroundColor Cyan
             Write-Host '  Your browser usually completes this step without asking again.' -ForegroundColor DarkGray
             try {
                 $ctx = Invoke-INTWizardSignIn -Method $config.AuthMethod -TenantId $selectedTenant -Scopes $Scopes
                 $config.WizardAuthenticated = $true
-                Write-Host "  Signed in successfully as: $($ctx.Account)" -ForegroundColor Green
+                $selectedTenant = [string]$ctx.TenantId
+                $tenantInfo = Get-INTSignedInTenant
+                Write-Host "  Signed in to $(if ($tenantInfo.Name) { "$($tenantInfo.Name)  ($($tenantInfo.DefaultDomain))" } else { $selectedTenant }) as $($ctx.Account)" -ForegroundColor Green
             } catch {
+                $config.WizardAuthenticated = $false
                 Write-Host "  Graph sign-in did not complete: $($_.Exception.Message)" -ForegroundColor Yellow
                 Write-Host '  The assessment will attempt sign-in again during execution.' -ForegroundColor Yellow
             }

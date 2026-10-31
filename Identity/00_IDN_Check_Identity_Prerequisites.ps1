@@ -53,11 +53,12 @@
 
     SIGN-IN
     -------
-    Sign-in is never silent. Azure Resource Manager is read through a short-lived child
-    process (Az.Accounts and Microsoft.Graph cannot share one process); it keeps its
-    session in memory and hands back an access token on its output stream, never on
-    disk. Microsoft Graph then signs in to the selected tenant with -ContextScope
-    Process, so no token is cached for the next run.
+    Sign-in is never silent, and the whole run happens in the PowerShell session you
+    start it from: Windows PowerShell 5.1, PowerShell 7 or PowerShell ISE. One Azure
+    sign-in (Az.Accounts) reads both Azure Resource Manager and Microsoft Graph, and the
+    script only reads (GET requests). The sign-in is kept in memory for this run only:
+    nothing is saved to disk, and an Azure PowerShell sign-in this window already had is
+    put back when the run ends.
 
     Exit codes: 0 = no failures, 1 = one or more FAIL results, 2 = execution error.
 
@@ -93,8 +94,8 @@
 
 .PARAMETER AuthMethod
     Interactive, DeviceCode, ServicePrincipalCertificate, or ManagedIdentity. No default:
-    the wizard asks, and -NonInteractive requires it. A client secret is not supported,
-    because it would have to be handed to the Azure child process.
+    the wizard asks, and -NonInteractive requires it. For a service principal, use a
+    certificate: a client secret is not accepted.
 
 .PARAMETER ApplicationId
     Application (client) ID for ServicePrincipalCertificate.
@@ -130,7 +131,9 @@
 .NOTES
     Author: etf
     Minimum roles: Reader on the subscription; Global Reader in Entra ID.
-    Graph permissions (delegated or application), read-only:
+    Signed in as a user, Microsoft Graph is read through the Microsoft Azure PowerShell
+    app, limited to what the account's own Entra roles allow. A service principal or
+    managed identity needs these Microsoft Graph application permissions, read-only:
         Organization.Read.All, Directory.Read.All, User.Read.All, Policy.Read.All,
         Application.Read.All, OnPremDirectorySynchronization.Read.All
 #>
@@ -167,55 +170,6 @@ param(
     [switch]$NoExport,
     [switch]$SkipModuleValidation
 )
-
-# PowerShell ISE cannot show the console of a child process, and this script starts
-# one, so from ISE it reopens itself in a PowerShell window with the same parameters.
-if ($Host.Name -eq 'Windows PowerShell ISE Host') {
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        Write-Warning 'Save this script to a file, then run it from a PowerShell window.'
-        return
-    }
-    $iseParameters = @{}
-    foreach ($iseKey in $PSBoundParameters.Keys) {
-        $iseValue = $PSBoundParameters[$iseKey]
-        if ($iseValue -is [System.Management.Automation.SwitchParameter]) { $iseValue = $iseValue.IsPresent }
-        $iseParameters[$iseKey] = $iseValue
-    }
-    $iseParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
-    $iseParameters | Export-Clixml -LiteralPath $iseParameterFile -Force
-    $iseCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p" -f $iseParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
-    $iseEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($iseCommand))
-    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoLogo', '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $iseEncoded)
-    Write-Host 'PowerShell ISE cannot show this script''s output, so it continues in a new PowerShell window.' -ForegroundColor Yellow
-    return
-}
-
-# Az and Microsoft.Graph ship different versions of the same sign-in assemblies, and a
-# PowerShell process cannot unload one to load the other. If a script run earlier in this
-# window left any of them loaded, continue in a clean process in this same window. A Graph
-# session opened on purpose (Microsoft.Graph.Authentication still loaded) is left alone,
-# and so is -PassThru, whose objects cannot cross the process boundary.
-if (-not $PassThru -and -not (Get-Module -Name 'Microsoft.Graph.Authentication') -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
-    $leftoverSignIn = @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {
-        $_.GetName().Name -match '^(Microsoft\.Identity\.Client|Azure\.Identity|Azure\.Core|Microsoft\.Graph\.|Microsoft\.Azure\.PowerShell\.)'
-    })
-    if ($leftoverSignIn.Count -gt 0) {
-        $cleanParameters = @{}
-        foreach ($cleanKey in $PSBoundParameters.Keys) {
-            $cleanValue = $PSBoundParameters[$cleanKey]
-            if ($cleanValue -is [System.Management.Automation.SwitchParameter]) { $cleanValue = $cleanValue.IsPresent }
-            $cleanParameters[$cleanKey] = $cleanValue
-        }
-        $cleanParameterFile = Join-Path ([IO.Path]::GetTempPath()) ('{0}_{1}.clixml' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), [guid]::NewGuid().ToString('N'))
-        $cleanParameters | Export-Clixml -LiteralPath $cleanParameterFile -Force
-        $cleanCommand = "`$p = Import-Clixml -LiteralPath '{0}'; Remove-Item -LiteralPath '{0}' -Force; & '{1}' @p; exit `$LASTEXITCODE" -f $cleanParameterFile.Replace("'", "''"), $PSCommandPath.Replace("'", "''")
-        $cleanEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanCommand))
-        $cleanEngine = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
-        Write-Host 'Sign-in components from an earlier script are loaded in this window, so this script continues in a clean PowerShell process.' -ForegroundColor Yellow
-        $cleanProcess = Start-Process -FilePath $cleanEngine -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $cleanEncoded) -NoNewWindow -Wait -PassThru
-        exit $cleanProcess.ExitCode
-    }
-}
 
 Set-StrictMode -Off   # Disabled to preserve PS5.1 broad compatibility with optional properties
 $ErrorActionPreference = 'Continue'
@@ -363,7 +317,7 @@ function Invoke-IDNModuleCleanup {
 }
 
 $preflight_Modules = @(
-    @{ Name = 'Microsoft.Graph.Authentication'; MinVersion = '2.0.0'; Required = $true }
+    @{ Name = 'Az.Accounts';                    MinVersion = '2.12.0'; Required = $true }
     @{ Name = 'ImportExcel'; MinVersion = '7.0.0'; Required = $true }
 )
 
@@ -676,10 +630,13 @@ function Invoke-IDNGraphRequest {
         [hashtable]$Headers
     )
 
-    $requestParams = @{ Method = 'GET'; Uri = $Uri; OutputType = 'PSObject'; ErrorAction = 'Stop' }
-    if ($Headers) { $requestParams['Headers'] = $Headers }
+    if (-not $script:GraphToken) { throw 'No Microsoft Graph session.' }
+    $requestHeaders = @{ Authorization = "Bearer $($script:GraphToken)" }
+    if ($Headers) { foreach ($key in $Headers.Keys) { $requestHeaders[$key] = $Headers[$key] } }
+    $target = if ($Uri -match '^https://') { $Uri } else { 'https://graph.microsoft.com/' + $Uri.TrimStart('/') }
+    $requestParams = @{ Method = 'GET'; Uri = $target; Headers = $requestHeaders; ErrorAction = 'Stop' }
 
-    $response = Invoke-MgGraphRequest @requestParams
+    $response = Invoke-RestMethod @requestParams
     if (-not $All) { return $response }
 
     $items = [System.Collections.Generic.List[object]]::new()
@@ -691,7 +648,7 @@ function Invoke-IDNGraphRequest {
         if ($response.PSObject.Properties.Name -contains '@odata.nextLink') { $nextLink = $response.'@odata.nextLink' }
         if ([string]::IsNullOrWhiteSpace($nextLink)) { break }
         $requestParams['Uri'] = $nextLink
-        $response = Invoke-MgGraphRequest @requestParams
+        $response = Invoke-RestMethod @requestParams
     }
     # Unrolled on purpose: callers wrap the call in @(...), and a comma-wrapped
     # return would nest the whole list inside a single element.
@@ -804,27 +761,22 @@ $script:SelectedVNet = $null
 
 #region -- Azure Resource Manager ---------------------------------------------
 
-function Get-IDNAzAccountsModulePath {
-    [CmdletBinding()]
-    param()
-
-    $local = Resolve-IDNBestLocalModule -Name 'Az.Accounts' -MinimumVersion ([version]'2.12.0')
-    if ($local) { return $local.Path }
-
-    if (-not (Get-Command -Name Save-Module -ErrorAction SilentlyContinue)) {
-        throw 'Az.Accounts is not installed and Save-Module is unavailable.'
-    }
-    $tempPath = Get-IDNModuleTempPath
-    if ($preflight_Result -and -not $preflight_Result.TempPath) { $preflight_Result.TempPath = $tempPath }
-    Write-Host '  Fetching Az.Accounts to temporary storage (used only for the Azure sign-in)...' -ForegroundColor DarkGray
-    Save-Module -Name 'Az.Accounts' -MinimumVersion '2.12.0' -Path $tempPath -Force -ErrorAction Stop
-    $manifest = Get-ChildItem -Path (Join-Path $tempPath 'Az.Accounts') -Filter 'Az.Accounts.psd1' -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $manifest) { throw 'Az.Accounts manifest not found after Save-Module completed.' }
-    return $manifest.FullName
+function ConvertTo-IDNTokenText {
+    param([Parameter(Mandatory=$true)] $Token)
+    # Az.Accounts 5 returns a SecureString, older versions a string.
+    if ($Token -isnot [System.Security.SecureString]) { return [string]$Token }
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Token)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
-function Connect-IDNAzureBroker {
+function Get-IDNTokenClaims {
+    param([Parameter(Mandatory=$true)] [string]$Token)
+    $payload = $Token.Split('.')[1].Replace('-', '+').Replace('_', '/')
+    $payload += '=' * ((4 - $payload.Length % 4) % 4)
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+}
+
+function Connect-IDNAzure {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)] [string]$Method,
@@ -835,192 +787,113 @@ function Connect-IDNAzureBroker {
         [switch]$NonInteractive
     )
 
-    # Runs Az.Accounts in a short-lived child process: Az and Microsoft.Graph ship
-    # different versions of the same identity assemblies and cannot share one
-    # process. The child keeps its session in memory, shows the tenant and
-    # subscription lists on stderr (the console), and returns its result as one
-    # marked line on stdout, which is read here and never written to disk.
-    $childScript = @'
-$ErrorActionPreference = 'Stop'
-# stdout is redirected (the parent reads the result line from it), so console
-# calls that need the stdout handle can fail with "The handle is invalid".
-# Screens go to stderr; color and clearing are best-effort.
-function Say([string]$Text, [string]$Color = 'Gray') {
-    try { [Console]::ForegroundColor = $Color } catch { $null = $_ }
-    [Console]::Error.WriteLine($Text)
-    try { [Console]::ResetColor() } catch { $null = $_ }
-}
-function Clear-Screen {
-    try { [Console]::Clear() } catch { [Console]::Error.Write(([char]27) + '[2J' + ([char]27) + '[3J' + ([char]27) + '[H') }
-}
-function Ask([string]$Prompt) { [Console]::Error.Write($Prompt); return [Console]::In.ReadLine() }
-function Pick([string]$Prompt, [int]$Max) {
-    while ($true) {
-        $raw = Ask ("{0} [1]: " -f $Prompt)
-        if ([string]::IsNullOrWhiteSpace($raw)) { return 1 }
-        if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le $Max) { return [int]$raw }
-        Say ("  Invalid choice. Please enter a number between 1 and {0}." -f $Max) 'Yellow'
-    }
-}
-$line70 = '-' * 70
-try {
-    Import-Module -Name $env:IDN_AZ_MODULE -ErrorAction Stop -WarningAction SilentlyContinue
+    # The sign-in lives in memory for this run only. Remember what this window already
+    # had, so Disconnect-IDNAzure can put it back.
+    $script:IDNPriorAzContext = Get-AzContext -ErrorAction SilentlyContinue
+    $script:IDNPriorAzContextNames = @(Get-AzContext -ListAvailable -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $script:IDNPriorAzAutosave = [string](Get-AzContextAutosaveSetting -ErrorAction SilentlyContinue).ContextSaveSetting
     Disable-AzContextAutosave -Scope Process | Out-Null
-    $interactive = $env:IDN_NONINTERACTIVE -ne '1'
+    $script:IDNAzConnected = $true
 
     $connectParams = @{ Scope = 'Process'; SkipContextPopulation = $true; ErrorAction = 'Stop' }
-    if ($env:IDN_TENANT) { $connectParams['TenantId'] = $env:IDN_TENANT }
-    switch ($env:IDN_METHOD) {
+    if ($TenantId) { $connectParams['TenantId'] = $TenantId }
+    switch ($Method) {
         'DeviceCode'                  { $connectParams['UseDeviceAuthentication'] = $true }
-        'ServicePrincipalCertificate' { $connectParams['ServicePrincipal'] = $true; $connectParams['ApplicationId'] = $env:IDN_APPID; $connectParams['CertificateThumbprint'] = $env:IDN_THUMBPRINT }
+        'ServicePrincipalCertificate' { $connectParams['ServicePrincipal'] = $true; $connectParams['ApplicationId'] = $ApplicationId; $connectParams['CertificateThumbprint'] = $CertificateThumbprint }
         'ManagedIdentity'             { $connectParams['Identity'] = $true; $connectParams.Remove('TenantId') }
     }
-    if ($env:IDN_METHOD -ne 'DeviceCode') { $connectParams['WarningAction'] = 'SilentlyContinue' }
+    if ($Method -ne 'DeviceCode') { $connectParams['WarningAction'] = 'SilentlyContinue' }
     Connect-AzAccount @connectParams | Out-Null
 
-    # -- Tenant ---------------------------------------------------------------
-    $tenantId = $env:IDN_TENANT
+    # -- Tenant -------------------------------------------------------------------
     $tenantName = ''
     $tenants = @(Get-AzTenant -ErrorAction Stop -WarningAction SilentlyContinue | Sort-Object Name)
-    if ($tenantId) {
-        $match = $tenants | Where-Object { $_.Id -eq $tenantId -or @($_.Domains) -contains $tenantId -or $_.DefaultDomain -eq $tenantId } | Select-Object -First 1
-        if ($match) { $tenantId = [string]$match.Id; $tenantName = [string]$match.Name }
+    if ($TenantId) {
+        $match = $tenants | Where-Object { $_.Id -eq $TenantId -or @($_.Domains) -contains $TenantId -or $_.DefaultDomain -eq $TenantId } | Select-Object -First 1
+        if ($match) { $TenantId = [string]$match.Id; $tenantName = [string]$match.Name }
     } elseif ($tenants.Count -eq 1) {
-        $tenantId = [string]$tenants[0].Id; $tenantName = [string]$tenants[0].Name
-    } elseif ($interactive -and $tenants.Count -gt 1) {
-        Clear-Screen
-        Say ''; Say "  $line70" 'White'; Say '  STEP 2 of 6  -  YOUR MICROSOFT 365 TENANT' 'White'; Say "  $line70" 'White'; Say ''
-        Say '  A tenant is your organization in Microsoft 365 and Entra ID: it holds your'
-        Say '  users, groups and devices. Select the tenant to assess.'
-        Say ''
+        $TenantId = [string]$tenants[0].Id; $tenantName = [string]$tenants[0].Name
+    } elseif (-not $NonInteractive -and $tenants.Count -gt 1) {
+        Write-IDNWizardHeader -Title 'STEP 1 of 4  -  SIGN IN  (tenant)'
+        Write-Host '  A tenant is your organization in Microsoft 365 and Entra ID: it holds your' -ForegroundColor Gray
+        Write-Host '  users, groups and devices. Select the tenant to assess.' -ForegroundColor Gray
+        Write-Host ''
         for ($i = 0; $i -lt $tenants.Count; $i++) {
-            Say ("  [{0,2}] {1}  ({2})" -f ($i + 1), $tenants[$i].Name, $tenants[$i].DefaultDomain) 'White'
-            Say ("        ID: {0}" -f $tenants[$i].Id) 'DarkGray'
+            Write-Host ("  [{0,2}] {1}  ({2})" -f ($i + 1), $tenants[$i].Name, $tenants[$i].DefaultDomain) -ForegroundColor White
+            Write-Host ("        ID: {0}" -f $tenants[$i].Id) -ForegroundColor DarkGray
         }
-        Say ''
-        $n = Pick '  Enter the number of the tenant to assess' $tenants.Count
-        $tenantId = [string]$tenants[$n - 1].Id; $tenantName = [string]$tenants[$n - 1].Name
+        Write-Host ''
+        $n = Get-IDNWizardMenuChoice -Min 1 -Max $tenants.Count -Default 1
+        $TenantId = [string]$tenants[$n - 1].Id; $tenantName = [string]$tenants[$n - 1].Name
     } else {
         throw 'No tenant could be determined. Pass -TenantId.'
     }
 
-    # Tokens are issued per tenant: sign in to the chosen one if it is not the
-    # tenant of the first sign-in (the browser usually completes this silently).
+    # Tokens are issued per tenant: sign in to the chosen one if it is not the tenant
+    # of the first sign-in (the browser usually completes this without asking again).
     $current = Get-AzContext
-    if ($null -eq $current -or [string]$current.Tenant.Id -ne $tenantId) {
-        Say '  Signing in to the selected tenant...' 'Cyan'
-        $connectParams['TenantId'] = $tenantId
+    if ($null -eq $current -or [string]$current.Tenant.Id -ne $TenantId) {
+        Write-Host '  Signing in to the selected tenant...' -ForegroundColor Cyan
+        $connectParams['TenantId'] = $TenantId
         Connect-AzAccount @connectParams | Out-Null
     }
 
-    # -- Subscription ---------------------------------------------------------
-    $subscriptionId = $env:IDN_SUBSCRIPTION
+    # -- Subscription -------------------------------------------------------------
     $subscriptionName = ''
-    $subs = @(Get-AzSubscription -TenantId $tenantId -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' } | Sort-Object Name)
-    if ($subscriptionId) {
-        $match = $subs | Where-Object { $_.Id -eq $subscriptionId } | Select-Object -First 1
-        if (-not $match) { throw "Subscription $subscriptionId is not enabled or not visible in tenant $tenantId." }
+    $subs = @(Get-AzSubscription -TenantId $TenantId -ErrorAction Stop -WarningAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' } | Sort-Object Name)
+    if ($SubscriptionId) {
+        $match = $subs | Where-Object { $_.Id -eq $SubscriptionId } | Select-Object -First 1
+        if (-not $match) { throw "Subscription $SubscriptionId is not enabled or not visible in tenant $TenantId." }
         $subscriptionName = [string]$match.Name
-    } elseif ($interactive) {
-        Clear-Screen
-        Say ''; Say "  $line70" 'White'; Say '  STEP 3 of 6  -  YOUR AZURE SUBSCRIPTION' 'White'; Say "  $line70" 'White'; Say ''
-        Say '  The subscription that holds (or will hold) the virtual network, storage'
-        Say '  account and domain. Azure resource checks run against it.'
-        Say ''
+    } elseif (-not $NonInteractive) {
+        Write-IDNWizardHeader -Title 'STEP 1 of 4  -  SIGN IN  (subscription)'
+        Write-Host '  The subscription that holds (or will hold) the virtual network, storage' -ForegroundColor Gray
+        Write-Host '  account and domain. Azure resource checks run against it.' -ForegroundColor Gray
+        Write-Host ''
         for ($i = 0; $i -lt $subs.Count; $i++) {
-            Say ("  [{0,2}] {1}" -f ($i + 1), $subs[$i].Name) 'White'
-            Say ("        ID: {0}" -f $subs[$i].Id) 'DarkGray'
+            Write-Host ("  [{0,2}] {1}" -f ($i + 1), $subs[$i].Name) -ForegroundColor White
+            Write-Host ("        ID: {0}" -f $subs[$i].Id) -ForegroundColor DarkGray
         }
         $none = $subs.Count + 1
-        Say ''
-        Say ("  [{0,2}] No subscription  -  check directory items only" -f $none) 'DarkGray'
-        Say ''
-        $n = Pick '  Enter the number of the subscription' $none
-        if ($n -ne $none) { $subscriptionId = [string]$subs[$n - 1].Id; $subscriptionName = [string]$subs[$n - 1].Name }
+        Write-Host ''
+        Write-Host ("  [{0,2}] No subscription  -  check directory items only" -f $none) -ForegroundColor DarkGray
+        Write-Host ''
+        $n = Get-IDNWizardMenuChoice -Min 1 -Max $none -Default 1
+        if ($n -ne $none) { $SubscriptionId = [string]$subs[$n - 1].Id; $subscriptionName = [string]$subs[$n - 1].Name }
     }
 
-    # -- Access token for Azure Resource Manager -------------------------------
-    $armToken = ''
-    $expiresOn = ''
-    if ($subscriptionId) {
-        $tok = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -TenantId $tenantId -ErrorAction Stop -WarningAction SilentlyContinue
-        if ($tok.Token -is [System.Security.SecureString]) {
-            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tok.Token)
-            try { $armToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-        } else {
-            $armToken = [string]$tok.Token
-        }
-        $expiresOn = [string]$tok.ExpiresOn
+    # -- Access token for Azure Resource Manager ----------------------------------
+    $script:ArmToken = $null
+    if ($SubscriptionId) {
+        $tok = Get-AzAccessToken -ResourceTypeName Arm -TenantId $TenantId -ErrorAction Stop -WarningAction SilentlyContinue
+        $script:ArmToken = ConvertTo-IDNTokenText -Token $tok.Token
     }
 
     $ctxNow = Get-AzContext
-    $account = if ($null -ne $ctxNow) { [string]$ctxNow.Account.Id } else { '' }
-    Disconnect-AzAccount -Scope Process -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null
-    $result = [ordered]@{
-        TenantId = $tenantId; TenantName = $tenantName; Account = $account
-        SubscriptionId = $subscriptionId; SubscriptionName = $subscriptionName
-        ArmToken = $armToken; ExpiresOn = $expiresOn
-    }
-    # Written straight to stdout so output formatting can never wrap the line.
-    [Console]::Out.WriteLine('IDN_RESULT:' + (ConvertTo-Json -InputObject $result -Compress))
-    exit 0
-} catch {
-    [Console]::Out.WriteLine('IDN_ERROR:' + ($_.Exception.Message -replace '\r?\n', ' '))
-    exit 1
-}
-'@
-
-    $modulePath = Get-IDNAzAccountsModulePath
-    # Same engine as this session (pwsh -> pwsh, powershell -> powershell), resolved
-    # from $PSHOME: in PowerShell ISE this process is powershell_ise.exe.
-    $pwshExe = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
-    if ([string]::IsNullOrWhiteSpace($pwshExe) -or -not (Test-Path -Path $pwshExe)) {
-        $pwshExe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell.exe' }
-    }
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-
-    $envMap = [ordered]@{
-        IDN_AZ_MODULE      = $modulePath
-        IDN_METHOD         = $Method
-        IDN_TENANT         = $TenantId
-        IDN_SUBSCRIPTION   = $SubscriptionId
-        IDN_APPID          = $ApplicationId
-        IDN_THUMBPRINT     = $CertificateThumbprint
-        IDN_NONINTERACTIVE = $(if ($NonInteractive) { '1' } else { '0' })
-    }
-    $previous = @{}
-    foreach ($name in $envMap.Keys) { $previous[$name] = [Environment]::GetEnvironmentVariable($name) }
-
-    $resultLine = $null
-    $errorLine = $null
-    try {
-        foreach ($name in $envMap.Keys) { [Environment]::SetEnvironmentVariable($name, [string]$envMap[$name]) }
-        & $pwshExe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded | ForEach-Object {
-            $line = [string]$_
-            if ($line.StartsWith('IDN_RESULT:')) { $resultLine = $line.Substring(11) }
-            elseif ($line.StartsWith('IDN_ERROR:')) { $errorLine = $line.Substring(10) }
-            else { Write-Host $line }
-        }
-    } finally {
-        # Remove-Item, not SetEnvironmentVariable($name, $null): PowerShell passes
-        # $null to .NET as '', which .NET (Core) keeps as an empty variable.
-        foreach ($name in $envMap.Keys) {
-            if ($null -eq $previous[$name]) { Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue }
-            else { Set-Item -Path "Env:$name" -Value $previous[$name] }
-        }
-    }
-
-    if ($errorLine) { throw "Azure sign-in did not complete: $errorLine" }
-    if (-not $resultLine) { throw 'Azure sign-in did not return a result.' }
-    $result = ConvertFrom-Json -InputObject $resultLine
-    $script:ArmToken = if ($result.ArmToken) { [string]$result.ArmToken } else { $null }
     return [PSCustomObject]@{
-        TenantId         = [string]$result.TenantId
-        TenantName       = [string]$result.TenantName
-        Account          = [string]$result.Account
-        SubscriptionId   = [string]$result.SubscriptionId
-        SubscriptionName = [string]$result.SubscriptionName
+        TenantId         = $TenantId
+        TenantName       = $tenantName
+        Account          = $(if ($null -ne $ctxNow) { [string]$ctxNow.Account.Id } else { '' })
+        SubscriptionId   = $SubscriptionId
+        SubscriptionName = $subscriptionName
     }
+}
+
+function Disconnect-IDNAzure {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:IDNAzConnected) { return }
+    $script:IDNAzConnected = $false
+    $priorAccounts = @(Get-AzContext -ListAvailable -ErrorAction SilentlyContinue |
+        Where-Object { $script:IDNPriorAzContextNames -contains $_.Name } | ForEach-Object { [string]$_.Account.Id })
+    foreach ($ctx in @(Get-AzContext -ListAvailable -ErrorAction SilentlyContinue | Where-Object { $script:IDNPriorAzContextNames -notcontains $_.Name })) {
+        # An account this window was already using keeps its sign-in; only this run's context goes.
+        if ($priorAccounts -contains [string]$ctx.Account.Id) { Remove-AzContext -InputObject $ctx -Force -ErrorAction SilentlyContinue }
+        else { Disconnect-AzAccount -AzureContext $ctx -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null }
+    }
+    if ($script:IDNPriorAzAutosave -eq 'CurrentUser') { Enable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null }
+    if ($null -ne $script:IDNPriorAzContext) { $null = Set-AzContext -Context $script:IDNPriorAzContext -ErrorAction SilentlyContinue -WarningAction SilentlyContinue }
 }
 
 function Invoke-IDNArmRequest {
@@ -1106,41 +979,19 @@ function Get-IDNResourceGroupScope {
 
 function Connect-IDNGraphAccount {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$true)] [string]$Method,
-        [Parameter(Mandatory=$true)] [string]$TenantId,
-        [Parameter(Mandatory=$true)] [string[]]$Scopes,
-        [string]$ApplicationId,
-        [string]$CertificateThumbprint
-    )
+    param([Parameter(Mandatory=$true)] [string]$TenantId)
 
     Write-IDNSection -Title 'MICROSOFT GRAPH AUTHENTICATION'
     try {
-        # ContextScope Process: the token lives in memory for this run only. The
-        # default (CurrentUser) caches it on disk and the next run signs in silently.
-        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-        $connectParams = @{ ErrorAction = 'Stop'; NoWelcome = $true; ContextScope = 'Process'; TenantId = $TenantId }
-        switch ($Method) {
-            'Interactive' {
-                Write-IDNLog -Level 'INFO' -Message 'Opening interactive sign-in for Microsoft Graph (your browser usually completes it)...'
-                Connect-MgGraph @connectParams -Scopes $Scopes | Out-Null
-            }
-            'DeviceCode' {
-                Write-IDNLog -Level 'INFO' -Message 'Device code authentication - visit https://microsoft.com/devicelogin'
-                Connect-MgGraph @connectParams -Scopes $Scopes -UseDeviceCode | Out-Null
-            }
-            'ServicePrincipalCertificate' {
-                Connect-MgGraph @connectParams -ClientId $ApplicationId -CertificateThumbprint $CertificateThumbprint | Out-Null
-            }
-            'ManagedIdentity' {
-                $connectParams.Remove('TenantId')
-                Connect-MgGraph @connectParams -Identity | Out-Null
-            }
-        }
-        $ctx = Get-MgContext -ErrorAction Stop
-        $who = if ($ctx.Account) { "$($ctx.Account) (via $($ctx.AppName))" } else { "app $($ctx.AppName) ($($ctx.ClientId))" }
+        # The same Azure sign-in, asked for a Microsoft Graph token: no second sign-in.
+        $tok = Get-AzAccessToken -ResourceTypeName MSGraph -TenantId $TenantId -ErrorAction Stop -WarningAction SilentlyContinue
+        $script:GraphToken = ConvertTo-IDNTokenText -Token $tok.Token
+        $claims = Get-IDNTokenClaims -Token $script:GraphToken
+        $script:GraphScopes = @(@(([string]$claims.scp) -split ' ') + @($claims.roles) | Where-Object { $_ })
+        $null = Invoke-IDNGraphRequest -Uri 'v1.0/organization?$select=id'
+        $who = if ($claims.upn) { "$($claims.upn) (via $($claims.app_displayname))" } else { "app $($claims.app_displayname) ($($claims.appid))" }
         Write-IDNLog -Level 'PASS' -Message "Authenticated: $who"
-        Write-IDNLog -Level 'INFO' -Message "Tenant: $($ctx.TenantId) | Auth type: $($ctx.AuthType)"
+        Write-IDNLog -Level 'INFO' -Message "Tenant: $($claims.tid)"
         return $true
     } catch {
         Write-IDNLog -Level 'FAIL' -Message "Microsoft Graph authentication failed: $($_.Exception.Message)"
@@ -1153,9 +1004,15 @@ function Test-IDNGraphPermissions {
     param([Parameter(Mandatory=$true)] [string[]]$RequiredScopes)
 
     Write-IDNSection -Title 'GRAPH PERMISSIONS'
-    $ctx = Get-MgContext -ErrorAction SilentlyContinue
-    $granted = @()
-    if ($null -ne $ctx -and $null -ne $ctx.Scopes) { $granted = @($ctx.Scopes) }
+    $granted = @($script:GraphScopes)
+
+    # A user signed in through Azure PowerShell reads with the account's own Entra roles.
+    if ($granted -contains 'Directory.AccessAsUser.All') {
+        Add-IDNCheckResult -Category 'Authentication' -CheckName 'Microsoft Graph Access' -Result 'PASS' `
+            -Details 'Signed in as a user: Microsoft Graph is read with the account''s own Entra roles (Global Reader is enough). A check the account cannot read reports access denied.' `
+            -DocLink 'https://learn.microsoft.com/entra/identity/role-based-access-control/permissions-reference#global-reader'
+        return
+    }
 
     foreach ($scope in $RequiredScopes) {
         $writeVariant = $scope -replace '\.Read\.', '.ReadWrite.'
@@ -1965,8 +1822,8 @@ function Invoke-IDNSetupWizard {
 
     # -- STEP 1: Sign in ---------------------------------------------------------
     Write-IDNWizardHeader -Title 'STEP 1 of 4  -  SIGN IN'
-    Write-Host '  You sign in to Azure to list your tenants and subscriptions, then to' -ForegroundColor Gray
-    Write-Host '  Microsoft Graph for the tenant you choose. Both are read-only.' -ForegroundColor Gray
+    Write-Host '  You sign in once, to Azure. The same sign-in lists your tenants and' -ForegroundColor Gray
+    Write-Host '  subscriptions and reads Microsoft Graph for the tenant you choose. Read-only.' -ForegroundColor Gray
     Write-Host '  How would you like to sign in?' -ForegroundColor Gray
     Write-Host ''
     Write-Host '  [1] Open a browser window to sign in (recommended for most users)' -ForegroundColor White
@@ -1983,13 +1840,13 @@ function Invoke-IDNSetupWizard {
         if (-not $SkipModuleValidation) { Import-IDNRequiredModulesToMemory -Modules $RequiredModules }
         Write-Host ''
         Write-Host '  Signing in to Azure...' -ForegroundColor Cyan
-        $config.Azure = Connect-IDNAzureBroker -Method $config.AuthMethod
+        $config.Azure = Connect-IDNAzure -Method $config.AuthMethod
         Clear-Host
         Write-Host ''
         Write-Host "  Tenant       : $($config.Azure.TenantName) ($($config.Azure.TenantId))" -ForegroundColor Green
         Write-Host "  Subscription : $(if ($config.Azure.SubscriptionId) { "$($config.Azure.SubscriptionName) ($($config.Azure.SubscriptionId))" } else { 'none  -  directory checks only' })" -ForegroundColor Green
         Write-Host ''
-        $config.GraphAuthenticated = Connect-IDNGraphAccount -Method $config.AuthMethod -TenantId $config.Azure.TenantId -Scopes $Scopes
+        $config.GraphAuthenticated = Connect-IDNGraphAccount -TenantId $config.Azure.TenantId
     } catch {
         Write-Host ''
         Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
@@ -2042,7 +1899,7 @@ function Invoke-IDNSetupWizard {
     Write-IDNWizardHeader -Title 'STEP 4 of 4  -  TEST USER'
     Write-Host '  A user who will sign in. The check confirms their identity source fits the model.' -ForegroundColor Gray
     Write-Host ''
-    $me = [string](Get-MgContext).Account
+    $me = [string]$config.Azure.Account
     Write-Host "  [1] Me  ($me)" -ForegroundColor White
     Write-Host '  [2] Another user  (you will type the UPN)' -ForegroundColor White
     Write-Host '  [3] Skip' -ForegroundColor DarkGray
@@ -2127,7 +1984,7 @@ function Show-Banner {
 #region -- Module List & Permissions ------------------------------------------
 
 $RequiredModules = @(
-    @{ Name = 'Microsoft.Graph.Authentication'; MinVersion = '2.0.0'; Required = $true }
+    @{ Name = 'Az.Accounts';                    MinVersion = '2.12.0'; Required = $true }
     @{ Name = 'ImportExcel';                    MinVersion = '7.0.0'; Required = $true }
 )
 
@@ -2199,7 +2056,7 @@ try {
     if ($NonInteractive) {
         Write-IDNSection -Title 'AZURE AUTHENTICATION'
         try {
-            $azure = Connect-IDNAzureBroker -Method $AuthMethod -TenantId $TenantId -SubscriptionId $SubscriptionId `
+            $azure = Connect-IDNAzure -Method $AuthMethod -TenantId $TenantId -SubscriptionId $SubscriptionId `
                 -ApplicationId $ApplicationId -CertificateThumbprint $CertificateThumbprint -NonInteractive
             $TenantId = $azure.TenantId
             Write-IDNLog -Level 'PASS' -Message "Azure: $($azure.Account) | Tenant $($azure.TenantId) | Subscription $(if ($azure.SubscriptionId) { $azure.SubscriptionName } else { 'none' })"
@@ -2209,8 +2066,7 @@ try {
                 -HowToFix 'Check the sign-in method and that the account can see the tenant and subscription.'
             throw 'Azure authentication failed. Aborting remaining checks.'
         }
-        $graphReady = Connect-IDNGraphAccount -Method $AuthMethod -TenantId $TenantId -Scopes $graphScopes `
-            -ApplicationId $ApplicationId -CertificateThumbprint $CertificateThumbprint
+        $graphReady = Connect-IDNGraphAccount -TenantId $TenantId
     }
 
     if (-not $graphReady) {
@@ -2338,10 +2194,11 @@ try {
 }
 finally {
     $script:ArmToken = $null
-    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    $script:GraphToken = $null
+    Disconnect-IDNAzure
     if (-not $NoExport -and -not $script:ReportExported -and $script:ValidationResults.Count -gt 0 -and (Get-Command -Name Export-Excel -ErrorAction SilentlyContinue)) {
         try {
-            $fallbackExport = Export-IDNValidationReport -OutputPath $script:ReportRootPath
+            $fallbackExport = Export-IDNValidationReport -OutputPath $ReportPath
             $script:ReportExported = $true
             Write-Host "  Excel (fallback): $($fallbackExport.ExcelPath)" -ForegroundColor Cyan
         } catch {
