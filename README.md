@@ -26,7 +26,7 @@ Get-Help .\AVD\00_AVD_Check_Deployment_Readiness.ps1 -Full
 - An account, service principal or managed identity with access to the environment being checked
 - Network access to Azure and Microsoft Graph from the computer running the script
 
-Missing Az or Microsoft Graph modules are staged in a temporary, operating-system-managed folder for the run and removed afterwards.
+Modules already installed are used wherever they are, OneDrive-synced Documents included. Missing Az, Microsoft Graph or ImportExcel modules are downloaded to a temporary folder for the run. They stay loaded until the PowerShell window closes, so the next run of the script deletes that folder.
 
 ## Download
 

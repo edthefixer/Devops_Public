@@ -200,7 +200,7 @@ function Resolve-IDNBestLocalModule {
     )
 
     return Get-Module -Name $Name -ListAvailable -ErrorAction SilentlyContinue |
-        Where-Object { $_.ModuleBase -notmatch 'OneDrive|(?:^|[\\/])_modules(?:[\\/]|$)' -and $_.Version -ge $MinimumVersion } |
+        Where-Object { $_.ModuleBase -notmatch '(?:^|[\\/])_modules(?:[\\/]|$)' -and $_.Version -ge $MinimumVersion } |
         Sort-Object Version -Descending |
         Select-Object -First 1
 }
@@ -222,9 +222,16 @@ function Invoke-IDNModulePreflight {
     Write-Host ('=' * 100) -ForegroundColor White
     Write-Host ''
 
-    if (-not (Get-Command -Name Save-Module -ErrorAction SilentlyContinue)) {
-        throw 'Save-Module is unavailable. Install or update PowerShellGet, then rerun this script.'
+    # Modules staged by an earlier run stay loaded until its window closes, so that run
+    # cannot delete them. Remove those folders now. A rename fails while another window
+    # still has the modules loaded, so only folders that can be renamed are deleted.
+    Get-ChildItem -Path $env:TEMP -Directory -Filter 'IDN_TempMod_*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $staleName = Join-Path $env:TEMP ('IDN_Stale_{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+        try { Rename-Item -LiteralPath $_.FullName -NewName (Split-Path $staleName -Leaf) -ErrorAction Stop } catch { return }
+        Remove-Item -LiteralPath $staleName -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Get-ChildItem -Path $env:TEMP -Directory -Filter 'IDN_Stale_*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
     $originalPSModulePath = $env:PSModulePath
     $needFetch = [System.Collections.Generic.List[string]]::new()
@@ -243,6 +250,9 @@ function Invoke-IDNModulePreflight {
     }
 
     if ($needFetch.Count -gt 0) {
+        if (-not (Get-Command -Name Save-Module -ErrorAction SilentlyContinue)) {
+            throw ("Save-Module is unavailable to fetch {0}. Install or update PowerShellGet, or install the module, then rerun this script." -f ($needFetch -join ', '))
+        }
         $tempPath = Get-IDNModuleTempPath
         foreach ($moduleName in $needFetch) {
             try {
@@ -307,7 +317,11 @@ function Invoke-IDNModuleCleanup {
 
     if ($hasTempPath) {
         Remove-Item -LiteralPath $PreflightResult.TempPath -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host ("Temp Cleanup - Pass: Deleted temporary folder: {0}" -f $PreflightResult.TempPath) -ForegroundColor DarkGray
+        if (Test-Path -LiteralPath $PreflightResult.TempPath) {
+            Write-Host ("Temp Cleanup - Info: Modules in {0} stay in use until this window closes; the next run deletes them." -f $PreflightResult.TempPath) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("Temp Cleanup - Pass: Deleted temporary folder: {0}" -f $PreflightResult.TempPath) -ForegroundColor DarkGray
+        }
     }
 
     $PreflightResult.ImportedModuleNames = @()

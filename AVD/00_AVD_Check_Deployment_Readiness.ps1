@@ -254,7 +254,7 @@ function Resolve-AVDBestLocalModule {
     )
 
     return Get-Module -Name $Name -ListAvailable -ErrorAction SilentlyContinue |
-        Where-Object { $_.ModuleBase -notmatch 'OneDrive|(?:^|[\\/])_modules(?:[\\/]|$)' -and $_.Version -ge $MinimumVersion } |
+        Where-Object { $_.ModuleBase -notmatch '(?:^|[\\/])_modules(?:[\\/]|$)' -and $_.Version -ge $MinimumVersion } |
         Sort-Object Version -Descending |
         Select-Object -First 1
 }
@@ -276,9 +276,16 @@ function Invoke-AVDModulePreflight {
     Write-Host ('=' * 100) -ForegroundColor White
     Write-Host ''
 
-    if (-not (Get-Command -Name Save-Module -ErrorAction SilentlyContinue)) {
-        throw 'Save-Module is unavailable. Install or update PowerShellGet, then rerun this script.'
+    # Modules staged by an earlier run stay loaded until its window closes, so that run
+    # cannot delete them. Remove those folders now. A rename fails while another window
+    # still has the modules loaded, so only folders that can be renamed are deleted.
+    Get-ChildItem -Path $env:TEMP -Directory -Filter 'AVD_TempMod_*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $staleName = Join-Path $env:TEMP ('AVD_Stale_{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+        try { Rename-Item -LiteralPath $_.FullName -NewName (Split-Path $staleName -Leaf) -ErrorAction Stop } catch { return }
+        Remove-Item -LiteralPath $staleName -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Get-ChildItem -Path $env:TEMP -Directory -Filter 'AVD_Stale_*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
     $originalPSModulePath = $env:PSModulePath
     $resolvedPaths = @{}
@@ -299,6 +306,9 @@ function Invoke-AVDModulePreflight {
     }
 
     if ($needFetch.Count -gt 0) {
+        if (-not (Get-Command -Name Save-Module -ErrorAction SilentlyContinue)) {
+            throw ("Save-Module is unavailable to fetch {0}. Install or update PowerShellGet, or install the module, then rerun this script." -f ($needFetch -join ', '))
+        }
         $tempPath = Get-AVDModuleTempPath
         foreach ($moduleName in $needFetch) {
             try {
@@ -364,7 +374,11 @@ function Invoke-AVDModuleCleanup {
 
     if ($hasTempPath) {
         Remove-Item -LiteralPath $PreflightResult.TempPath -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host ("Temp Cleanup - Pass: Deleted temporary folder: {0}" -f $PreflightResult.TempPath) -ForegroundColor DarkGray
+        if (Test-Path -LiteralPath $PreflightResult.TempPath) {
+            Write-Host ("Temp Cleanup - Info: Modules in {0} stay in use until this window closes; the next run deletes them." -f $PreflightResult.TempPath) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("Temp Cleanup - Pass: Deleted temporary folder: {0}" -f $PreflightResult.TempPath) -ForegroundColor DarkGray
+        }
     }
 
     $PreflightResult.ImportedModuleNames = @()
@@ -381,21 +395,12 @@ $preflight_Modules = @(
     @{ Name = 'Az.Network'; MinVersion = '5.0.0'; Required = $true }
     @{ Name = 'Az.Storage'; MinVersion = '5.0.0'; Required = $true }
     @{ Name = 'Az.KeyVault'; MinVersion = '4.0.0'; Required = $true }
+    @{ Name = 'ImportExcel'; MinVersion = '7.0.0'; Required = $true }
 )
 
 $preflight_Result = $null
 if (-not $SkipModuleValidation) {
     $preflight_Result = Invoke-AVDModulePreflight -Modules $preflight_Modules
-}
-
-$capabilityValidationPath = Join-Path $PSScriptRoot 'AVD_NewCapabilityValidations.ps1'
-if (-not (Test-Path $capabilityValidationPath)) {
-    $capabilityValidationPath = Join-Path (Get-Location).Path 'AVD_NewCapabilityValidations.ps1'
-}
-if (Test-Path $capabilityValidationPath) {
-    . $capabilityValidationPath
-} else {
-    Write-Warning 'New AVD capability validation helpers were not found; managed identity and modern feature checks will be skipped.'
 }
 
 trap {
@@ -1467,6 +1472,28 @@ function Test-AVDNetworkConfiguration {
     } # end foreach vnet
 }
 
+# TCP reachability with a short timeout. Test-NetConnection waits about 21 seconds
+# on every blocked port, which added minutes to runs from locked-down networks.
+function Test-AVDTcpPort {
+    param(
+        [Parameter(Mandatory=$true)] [string]$ComputerName,
+        [Parameter(Mandatory=$true)] [int]$Port,
+        [int]$TimeoutMs = 5000
+    )
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $attempt = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        if (-not $attempt.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $client.EndConnect($attempt)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
 function Test-AVDEndpointConnectivity {
     [CmdletBinding()]
     param()
@@ -1489,8 +1516,7 @@ function Test-AVDEndpointConnectivity {
     foreach ($ep in $endpoints) {
         $warnOnly = ($null -ne $ep.WarnOnly -and $ep.WarnOnly -eq $true)
         try {
-            $reach = Test-NetConnection -ComputerName $ep.Host -Port $ep.Port `
-                         -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+            $reach = Test-AVDTcpPort -ComputerName $ep.Host -Port $ep.Port
             if ($reach) {
                 Add-AVDCheckResult `
                     -Category 'Connectivity' `
@@ -1890,8 +1916,7 @@ function Test-AVDStorageReadiness {
         if (-not $skipPort) {
             $fqdn = "$saName.file.core.windows.net"
             try {
-                $tcp = Test-NetConnection -ComputerName $fqdn -Port 445 `
-                           -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+                $tcp = Test-AVDTcpPort -ComputerName $fqdn -Port 445
                 if ($tcp) {
                     Add-AVDCheckResult `
                         -Category 'Storage' `
@@ -1957,8 +1982,7 @@ function Test-AVDDomainConnectivity {
 
             $firstIp = $dnsHits[0].IPAddress
             try {
-                $ldap = Test-NetConnection -ComputerName $firstIp -Port 389 `
-                            -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+                $ldap = Test-AVDTcpPort -ComputerName $firstIp -Port 389
                 if ($ldap) {
                     Add-AVDCheckResult `
                         -Category 'Identity' `
@@ -1979,8 +2003,7 @@ function Test-AVDDomainConnectivity {
                 }
 
             try {
-                $ldaps = Test-NetConnection -ComputerName $firstIp -Port 636 `
-                             -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+                $ldaps = Test-AVDTcpPort -ComputerName $firstIp -Port 636
                 $ldapsResult = if ($ldaps) { 'PASS' } else { 'INFO' }
                 $ldapsDetail = if ($ldaps) { "LDAPS port 636 reachable on $firstIp" } else { "LDAPS port 636 not reachable on $firstIp (optional but recommended)" }
                 Add-AVDCheckResult `
@@ -2820,7 +2843,7 @@ function Invoke-AVDSetupWizard {
     Write-Host ''
     Write-Host "  $line70" -ForegroundColor DarkGray
     Write-Host ''
-    Read-Host '  Press ENTER to begin  '
+    $null = Read-Host '  Press ENTER to begin  '
 
     $config = [ordered]@{
         AuthMethod            = 'CurrentContext'
@@ -2873,6 +2896,7 @@ function Invoke-AVDSetupWizard {
 
     # Perform authentication now so we can enumerate subscriptions in Step 2
     $wizAuthOk = $false
+    $wizAuthError = $null
     try {
         if ($config.AuthMethod -eq 'CurrentContext') {
             $existingCtx = Get-AzContext -ErrorAction SilentlyContinue
@@ -2910,9 +2934,7 @@ function Invoke-AVDSetupWizard {
             $wizAuthOk = $true
         }
     } catch {
-        Write-Host ''
-        Write-Host "  Sign-in did not complete: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host '  The assessment will attempt sign-in again during execution.' -ForegroundColor Yellow
+        $wizAuthError = $_.Exception.Message
     }
 
     $config.WizardAuthenticated = $wizAuthOk
@@ -2931,6 +2953,16 @@ function Invoke-AVDSetupWizard {
     Write-Host '  Select the subscription where AVD will be deployed.' -ForegroundColor Gray
     Write-Host ''
 
+    # The sign-in result is shown here, not on the Step 1 screen, which is cleared
+    # before anyone can read it (a browser that already knows the account signs in
+    # without showing a page, so this line is the only sign that it happened).
+    if ($wizAuthOk) {
+        Write-Host "  Signed in as: $($existingCtx.Account.Id)" -ForegroundColor Green
+    } else {
+        Write-Host "  Sign-in did not complete: $wizAuthError" -ForegroundColor Red
+    }
+    Write-Host ''
+
     if ($wizAuthOk) {
         try {
             $wizardSubs = @(Get-AzSubscription -ErrorAction Stop |
@@ -2945,6 +2977,8 @@ function Invoke-AVDSetupWizard {
                 Write-Host "  Only one subscription found  -  automatically selected:" -ForegroundColor Green
                 Write-Host "  $($wizardSubs[0].Name)" -ForegroundColor White
                 Write-Host "  ID: $($wizardSubs[0].Id)" -ForegroundColor DarkGray
+                Write-Host ''
+                $null = Read-Host '  Press ENTER to continue'
             } else {
                 Write-Host '  Your available subscriptions:' -ForegroundColor White
                 Write-Host ''
@@ -2963,11 +2997,16 @@ function Invoke-AVDSetupWizard {
                 Write-Host "  Selected: $($wizardSubs[$subChoice-1].Name)" -ForegroundColor Green
             }
         } catch {
-            Write-Host '  Could not retrieve the subscription list. Will use the current session context.' -ForegroundColor Yellow
+            Write-Host "  Could not retrieve the subscription list: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host '  The assessment will use the subscription of the current session.' -ForegroundColor DarkGray
+            Write-Host ''
+            $null = Read-Host '  Press ENTER to continue'
         }
     } else {
-        Write-Host '  Sign-in was not completed  -  subscription selection will be skipped.' -ForegroundColor Yellow
-        Write-Host '  The assessment will use whichever subscription is set in the current context.' -ForegroundColor DarkGray
+        Write-Host '  Subscription selection is skipped. The assessment tries the same sign-in again' -ForegroundColor Yellow
+        Write-Host '  before it starts. If that fails too, run the script again and choose [2] device code.' -ForegroundColor Yellow
+        Write-Host ''
+        $null = Read-Host '  Press ENTER to continue'
     }
 
     # =========================================================================
@@ -3587,14 +3626,6 @@ Test-AVDResourceProviders `
 # -- STEP 5: Entra ID Requirements --------------------------------------------
 Test-AVDEntraIDRequirements
 
-if (Get-Command -Name Test-AVDExternalIdentitiesSupport -ErrorAction SilentlyContinue) {
-    Test-AVDExternalIdentitiesSupport
-}
-
-if (Get-Command -Name Test-AVDWindowsServer2025Support -ErrorAction SilentlyContinue) {
-    Test-AVDWindowsServer2025Support -ResourceGroupName $ResourceGroupName
-}
-
 # -- STEP 6: RBAC Assessment --------------------------------------------------
 Test-AVDRBACRequirements `
     -SubscriptionId    $SubscriptionId `
@@ -3606,10 +3637,6 @@ Test-AVDNetworkConfiguration `
     -ResourceGroupName $ResourceGroupName `
     -VNetName          $VNetName `
     -SubnetName        $SubnetName
-
-if (Get-Command -Name Test-AVDRDPMultipathSupport -ErrorAction SilentlyContinue) {
-    Test-AVDRDPMultipathSupport
-}
 
 # -- STEP 8: Endpoint Connectivity --------------------------------------------
 if (-not $SkipConnectivityTests) {
@@ -3644,10 +3671,6 @@ Test-AVDStorageReadiness `
     -ResourceGroupName  $ResourceGroupName `
     -StorageAccountName $StorageAccountName `
     -SkipPortTest:$SkipConnectivityTests
-
-if ($TargetRegion -and (Get-Command -Name Test-AVDSessionHostConfigurationSupport -ErrorAction SilentlyContinue)) {
-    Test-AVDSessionHostConfigurationSupport -TargetRegion $TargetRegion
-}
 
 # -- STEP 11: Identity Model - Specific Checks --------------------------------
 # AD DS / domain connectivity (required when identity model needs on-prem or hybrid AD)
@@ -3687,11 +3710,6 @@ if ($IdentityModel -in @('EntraDS','All')) {
     Test-AVDEntraDSReadiness -TargetRegion $TargetRegion -ResourceGroupName $ResourceGroupName
 }
 
-if (Get-Command -Name Test-AVDManagedIdentityReadiness -ErrorAction SilentlyContinue) {
-    $managedIdentitySubscriptionId = if ($SubscriptionId) { $SubscriptionId } else { (Get-AzContext).Subscription.Id }
-    Test-AVDManagedIdentityReadiness -SubscriptionId $managedIdentitySubscriptionId
-}
-
 # -- STEP 12: Monitoring ------------------------------------------------------
 Test-AVDMonitoringReadiness -ResourceGroupName $ResourceGroupName
 
@@ -3703,10 +3721,6 @@ Test-AVDServiceConfiguration -ResourceGroupName $ResourceGroupName
 
 # -- STEP 15: Image Gallery ---------------------------------------------------
 Test-AVDImageReadiness -ResourceGroupName $ResourceGroupName
-
-    if (Get-Command -Name Test-AVDAppAttachSupport -ErrorAction SilentlyContinue) {
-        Test-AVDAppAttachSupport -ResourceGroupName $ResourceGroupName -TargetRegion $TargetRegion
-    }
 
 # ==============================================================================
 # RESULTS SUMMARY
