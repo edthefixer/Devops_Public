@@ -2,16 +2,15 @@
 
 PowerShell scripts that check whether an environment is ready before anything is deployed: Azure Virtual Desktop (AVD), Microsoft Intune, and identity provisioning across cloud and on-premises.
 
-Every script is self-contained: one `.ps1` file, no other file from this repository required. The one exception is `AVD\03_AVD_Check_Platform_Prerequisites.ps1`, which runs `00_AVD_Check_Deployment_Readiness.ps1` as part of its check, so keep the two in the same folder. They report what is wrong, why it matters and how to fix it.
+Every script is self-contained: one `.ps1` file, no other file from this repository required. They report what is wrong, why it matters and how to fix it.
 
-**They change nothing in your environment unless you explicitly ask.** The two scripts that can make a change, `02` and `03`, say so below. Signing in is the one side effect on the computer you run them from: some scripts sign out the Azure PowerShell account saved there first, as noted for each.
+**They change nothing in your environment unless you explicitly ask.** The one script that can make a change, `02`, says so below. Signing in is the one side effect on the computer you run them from: some scripts sign out the Azure PowerShell account saved there first, as noted for each.
 
 | Folder | Script | Checks |
 | --- | --- | --- |
 | `AVD` | `00_AVD_Check_Deployment_Readiness.ps1` | Broad AVD pre-deployment readiness |
 | `AVD` | `01_AVD_Validate_VMSizeAndQuota.ps1` | VM size and quota (English, Spanish, Portuguese) |
 | `AVD` | `02_AVD_Validate_Network_Configuration.ps1` | AVD network configuration (English, Spanish, Portuguese) |
-| `AVD` | `03_AVD_Check_Platform_Prerequisites.ps1` | Tenant-wide AVD platform prerequisites |
 | `Intune` | `00_INT_Check_Deployment_Readiness.ps1` | Microsoft Intune deployment readiness |
 | `Identity` | `00_IDN_Check_Identity_Prerequisites.ps1` | Identity provisioning prerequisites |
 
@@ -63,7 +62,7 @@ Three scripts take an `-AuthMethod` parameter:
 | `ServicePrincipalCertificate` | App registration with a certificate | ✓ | ✓ | ✓ |
 | `ManagedIdentity` | The managed identity of the machine running the script | ✓ | ✓ | ✓ |
 
-The other three have no `-AuthMethod`. `01` and `02` always sign in afresh, with a choice of methods in the guided setup and browser sign-in when unattended. `03` offers to reuse your existing Az session, and uses it when unattended.
+`01` and `02` have no `-AuthMethod`. They always sign in afresh, with a choice of methods in the guided setup and browser sign-in when unattended.
 
 A read-only role such as **Reader** is a reasonable start; identity, networking, storage and directory checks can need more.
 
@@ -129,22 +128,6 @@ Optional: `-SkipDNSValidation`, `-SkipPeeringValidation`, `-SkipLatencyTest`.
 
 It is read-only unless you ask for changes. `-EnableRemediation` offers to fix what it found (a missing NSG rule, a missing private DNS zone, a peering problem, a blocking route), asking before each change. `-AutoFixAll` with it makes every fix **without asking**: run without either first and review the findings.
 
-### `03_AVD_Check_Platform_Prerequisites.ps1`
-
-Platform-level AVD readiness for the whole tenant, whatever the deployment method (portal, ARM, Bicep, Terraform): subscription, resource providers, the AVD service principal and its roles, region and availability zones, Active Directory, the identity model, and VM SKU restrictions and quota, with alternatives when a SKU is blocked. It also runs `00` (keep it in the same folder). English.
-
-By default it asks before each change it could make (for example registering a resource provider), and the default answer is no. For a run that only reports:
-
-```powershell
-.\AVD\03_AVD_Check_Platform_Prerequisites.ps1 `
-    -SubscriptionId "YOUR-SUBSCRIPTION-ID" `
-    -TargetRegion "eastus2" `
-    -RemediationMode AssessOnly `
-    -NonInteractive
-```
-
-To preview the safe changes without making them: `-RemediationMode Guided -ApplySafeRemediations -WhatIf`.
-
 ## Intune
 
 ### `00_INT_Check_Deployment_Readiness.ps1`
@@ -180,7 +163,7 @@ The Excel report opens on a **Summary** sheet: the model checked, the tenant, wh
 
 ## Reports
 
-Every script writes an Excel report, by default beside the script. `00_AVD`, `03`, `00_INT` and `00_IDN` take a folder in `-ReportPath`; `02` takes a file name in `-ReportPath` and always writes beside the script. `-NoExport` turns the report off in `00_AVD`, `01`, `00_INT` and `00_IDN`.
+Every script writes an Excel report, by default beside the script. `00_AVD`, `00_INT` and `00_IDN` take a folder in `-ReportPath`; `02` takes a file name in `-ReportPath` and always writes beside the script. `-NoExport` turns the report off in `00_AVD`, `01`, `00_INT` and `00_IDN`.
 
 Reports contain tenant, subscription, resource and network details: review them before sharing, and do not commit them to a repository.
 
