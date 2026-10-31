@@ -809,6 +809,14 @@ function Connect-IDNAzure {
     Disable-AzContextAutosave -Scope Process | Out-Null
     $script:IDNAzConnected = $true
 
+    # A context made with Connect-AzAccount -AccessToken can never renew its token, and
+    # Az keys accounts by user name: a fresh sign-in as the same user kept the expired
+    # token and the subscription list failed. Leave such contexts out of this run (in
+    # memory only; the saved copy is untouched and Disconnect-IDNAzure restores it).
+    foreach ($ctx in @(Get-AzContext -ListAvailable -ErrorAction SilentlyContinue | Where-Object { [string]$_.Account.Type -eq 'AccessToken' })) {
+        Remove-AzContext -InputObject $ctx -Force -Scope Process -ErrorAction SilentlyContinue
+    }
+
     $connectParams = @{ Scope = 'Process'; SkipContextPopulation = $true; ErrorAction = 'Stop' }
     if ($TenantId) { $connectParams['TenantId'] = $TenantId }
     switch ($Method) {
